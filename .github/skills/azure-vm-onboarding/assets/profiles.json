@@ -1,0 +1,22 @@
+{
+  "defaultLocation": "westus2",
+  "defaultSize": "small",
+  "cpu": {
+    "small": { "sku": "Standard_D16ds_v7", "vcpus": 16, "memoryGiB": 64, "nvmeDevices": 2, "nvmeGiBPerDevice": 440 },
+    "medium": { "sku": "Standard_D32ds_v7", "vcpus": 32, "memoryGiB": 128, "nvmeDevices": 4, "nvmeGiBPerDevice": 440 },
+    "large": { "sku": "Standard_D64ds_v7", "vcpus": 64, "memoryGiB": 256, "nvmeDevices": 4, "nvmeGiBPerDevice": 880 },
+    "xl": { "sku": "Standard_D128ds_v7", "vcpus": 128, "memoryGiB": 512, "nvmeDevices": 4, "nvmeGiBPerDevice": 1760 }
+  },
+  "gpu": {
+    "small": { "sku": "Standard_NC36ds_xl_RTXPRO6000BSE_v6", "vcpus": 36, "memoryGiB": 132, "gpuCount": 0.25, "gpuMemoryGB": 24, "localNvmeGiB": 1600 },
+    "medium": { "sku": "Standard_NC72ds_xl_RTXPRO6000BSE_v6", "vcpus": 72, "memoryGiB": 264, "gpuCount": 0.5, "gpuMemoryGB": 48, "localNvmeGiB": 3200 },
+    "large": { "sku": "Standard_NC144ds_xl_RTXPRO6000BSE_v6", "vcpus": 144, "memoryGiB": 516, "gpuCount": 1, "gpuMemoryGB": 96, "localNvmeGiB": 6400 },
+    "xl": { "sku": "Standard_NC288ds_xl_RTXPRO6000BSE_v6", "vcpus": 288, "memoryGiB": 1032, "gpuCount": 2, "gpuMemoryGB": 192, "localNvmeGiB": 12800 }
+  },
+  "gpuSupportedUbuntuLts": [ "24_04", "22_04", "20_04" ],
+  "sources": {
+    "cpu": "https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv7-series",
+    "gpu": "https://learn.microsoft.com/azure/virtual-machines/sizes/gpu-accelerated/nc-rtxpro6000-bse-v6-series",
+    "gpuOs": "https://learn.microsoft.com/azure/virtual-machines/sizes/gpu-accelerated/nc-rtxpro6000-bse-v6-series-overview"
+  }
+}

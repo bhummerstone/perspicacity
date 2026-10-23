@@ -1,0 +1,14 @@
+{
+  "subscriptionId": "00000000-0000-0000-0000-000000000000",
+  "resourceGroup": "rg-perspicacity-dev",
+  "namePrefix": "perspicacity",
+  "compute": "cpu",
+  "size": "small",
+  "location": "westus2",
+  "adminUsername": "azureuser",
+  "owner": "research-team",
+  "sshPublicKeyPath": "~/.ssh/perspicacity.pub",
+  "vnetCidr": "192.168.0.0/24",
+  "bastionSubnetCidr": "192.168.0.0/26",
+  "vmSubnetCidr": "192.168.0.64/26"
+}
