@@ -4,10 +4,10 @@ Interactive Azure development-VM onboarding for coding agents, backed by Bicep a
 
 ## Use the skill
 
-The repository skill is [azure-vm-onboarding](.github/skills/azure-vm-onboarding/SKILL.md).
+The repository skill is [perspicacity-azure-onboard](.github/skills/perspicacity-azure-onboard/SKILL.md).
 Ask a skill-capable coding agent:
 
-> Use azure-vm-onboarding to configure a new Azure development VM.
+> Use perspicacity-azure-onboard to configure a new Azure development VM.
 
 The agent guides you through subscription, CPU/GPU, region, priced Small/Medium/Large/XL options,
 owner/team, username, local SSH keys and private IP addressing. It generates configuration, checks
@@ -15,7 +15,7 @@ live Azure availability, quota and reported deployment permissions, and requires
 of the fresh itemized PAYG estimate before deploying billable resources. Bastion SSH/VS Code remains
 the secure default. Docker Engine is installed on first boot; application containers and data-source
 integrations remain out of scope.
-To use it in another repository, copy the entire `.github/skills/azure-vm-onboarding` directory,
+To use it in another repository, copy the entire `.github/skills/perspicacity-azure-onboard` directory,
 including its assets, references and Python helper, into that repository's skills directory.
 
 **Defaults:** West US 2, Small CPU, VNet `192.168.0.0/24`, Bastion subnet `192.168.0.0/26`,
@@ -60,7 +60,7 @@ No research containers or NVIDIA Container Toolkit are installed. Docker storage
 disk; the E70 and local NVMe remain untouched. This adds no Azure resources or fixed service charge.
 Cloud-init may still be running after Azure reports VM provisioning success. Require
 `sudo cloud-init status --wait`, Docker daemon/plugin checks and (for GPU) `nvidia-smi` before claiming
-readiness; see [operations](.github/skills/azure-vm-onboarding/references/operations.md).
+readiness; see [operations](.github/skills/perspicacity-azure-onboard/references/operations.md).
 
 Sources: [CPU specifications](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv7-series),
 [GPU specifications](https://learn.microsoft.com/azure/virtual-machines/sizes/gpu-accelerated/nc-rtxpro6000-bse-v6-series),
@@ -72,7 +72,7 @@ Sources: [CPU specifications](https://learn.microsoft.com/azure/virtual-machines
 Fetch current USD Linux PAYG prices without signing into Azure or providing a key/configuration:
 
 ```powershell
-python .github\skills\azure-vm-onboarding\scripts\onboarding.py prices --location westus2
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py prices --location westus2
 ```
 
 Add `--compute cpu` or `--compute gpu` to show one family. The skill shows these costs alongside
@@ -100,12 +100,25 @@ the NAT line uses its explicitly Global public-cloud meter.
 
 ## Generate without deploying
 
+The skill first checks Azure CLI and offers to install the latest stable version if it is missing,
+using explicit consent and Microsoft's OS-specific installation instructions. Windows uses WinGet
+when available; macOS uses Homebrew; Linux follows distribution-specific Microsoft repositories.
+No software is installed automatically. Manual installation and pricing-only paths are available.
+
+```powershell
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py prerequisites
+```
+
+This needs neither Azure login nor a configuration file. Exit 0 confirms the installed CLI responds
+to `az version`; exit 2 reports a missing CLI with an installation proposal for the agent to offer.
+After an approved install, reopen/refresh the terminal if needed and rerun the check before continuing.
+
 Prerequisites: Python 3.10+, Azure CLI with Bicep, OpenSSH `ssh-keygen`, Azure login/read and deployment permissions,
 and access to Azure and Microsoft Container Registry. No Python packages are required.
 Create a unique passphrase-protected SSH key in your own terminal, or use an existing public key.
 Never give an agent your private key or passphrase.
 
-Copy the [example configuration](.github/skills/azure-vm-onboarding/assets/config.example.json) to
+Copy the [example configuration](.github/skills/perspicacity-azure-onboard/assets/config.example.json) to
 `.azure-vm/request.json` and replace its subscription UUID, names, owner/team, username and public-key path.
 The required `owner` is a resource tag, not a role assignment. Older requests need this field and
 regenerated/reviewed parameters. The helper accepts only new/empty resource groups and never changes
@@ -113,7 +126,7 @@ the active subscription or grants roles. It checks the caller's reported actions
 for a new group, or at an existing empty group's scope; deny assignments and policy still require ARM validation.
 
 ```powershell
-python .github\skills\azure-vm-onboarding\scripts\onboarding.py generate --config .azure-vm\request.json --output .azure-vm\dev
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py generate --config .azure-vm\request.json --output .azure-vm\dev
 ```
 
 The ignored output directory contains Bicep, parameters, normalized configuration, timestamped preflight
@@ -126,7 +139,7 @@ After ARM validation/what-if, recheck the same generated parameters to refresh p
 and prices, then show the fresh costs and obtain final deployment approval:
 
 ```powershell
-python .github\skills\azure-vm-onboarding\scripts\onboarding.py check --config .azure-vm\dev\config.json --parameters .azure-vm\dev\main.parameters.json
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py check --config .azure-vm\dev\config.json --parameters .azure-vm\dev\main.parameters.json
 ```
 
 **Availability and quota are checked for every region, including the default.** Insufficient quota,
@@ -134,7 +147,7 @@ SKU restrictions, image incompatibility or missing permissions stop the flow. Su
 not guarantee physical capacity; ARM validation/what-if and user confirmation are still required.
 The helper reports overlapping Azure VNets; the user must also check LAN/VPN/peering address overlap.
 
-See [operations](.github/skills/azure-vm-onboarding/references/operations.md) for deployment gates,
+See [operations](.github/skills/perspicacity-azure-onboard/references/operations.md) for deployment gates,
 Bastion tunneling, VS Code, GPU verification and safe disk handling.
 VM deallocation does **not** stop Bastion, NAT, public-IP or managed-disk charges.
 E70 provisions 16 TiB even on Small; review current costs before deploying.
@@ -150,5 +163,5 @@ python -m unittest discover -s tests -v
 Compile the checked-in AVM baseline without deploying:
 
 ```powershell
-az bicep build --file .github\skills\azure-vm-onboarding\assets\infra\main.bicep --stdout
+az bicep build --file .github\skills\perspicacity-azure-onboard\assets\infra\main.bicep --stdout
 ```

@@ -49,6 +49,12 @@ class OnboardingError(Exception):
 def command(args):
     executable = shutil.which(args[0])
     if not executable:
+        if args[0] == "az":
+            raise OnboardingError(
+                "Azure CLI is missing from PATH. Installation can be offered with your permission; "
+                "run onboarding.py prerequisites for the platform-specific install option. "
+                "The onboarding skill asks for consent before installing, then verifies az version."
+            )
         raise OnboardingError(f"Missing prerequisite: {args[0]}. Install it and retry.")
     # Windows batch wrappers interpret metacharacters even with shell=False.
     if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
@@ -72,6 +78,39 @@ def az(*args, subscription=None):
     if subscription:
         argv.extend(["--subscription", subscription])
     return json.loads(command(argv))
+
+
+def prerequisites():
+    """Check Azure CLI without login; return an install proposal, never execute it."""
+    if shutil.which("az"):
+        version = az("version")["azure-cli"]
+        if not isinstance(version, str) or not version.strip():
+            raise OnboardingError("Azure CLI did not report a usable version; repair it before continuing.")
+        return {"status": "AzureCliReady", "azureCli": {"installed": True, "version": version}}
+    installation = {"requiresConsent": True, "commands": []}
+    guide = "https://learn.microsoft.com/cli/azure/install-azure-cli"
+    if sys.platform == "win32":
+        installation["method"] = "WinGet or Microsoft's signed MSI installer"
+        installation["documentation"] = guide + "-windows"
+        if shutil.which("winget"):
+            installation["commands"] = [
+                ["winget", "install", "--exact", "--id", "Microsoft.AzureCLI", "--source", "winget"],
+            ]
+    elif sys.platform == "darwin":
+        installation["method"] = "Homebrew"
+        installation["documentation"] = guide + "-macos"
+        if shutil.which("brew"):
+            installation["commands"] = [["brew", "update"], ["brew", "install", "azure-cli"]]
+    else:
+        installation["method"] = "Microsoft's instructions for the execution host's OS/distribution"
+        installation["documentation"] = guide + ("-linux" if sys.platform.startswith("linux") else "")
+    return {
+        "status": "AwaitingAzureCliInstallConsent", "azureCli": {"installed": False},
+        "installation": installation,
+        "nextStep": "Offer the latest stable Azure CLI installation using the host's question tool; "
+                    "do not install until approved. After installation, refresh the terminal/PATH "
+                    "if necessary and rerun prerequisites before login or deployment.",
+    }
 
 
 def validate_networks(config):
@@ -608,7 +647,7 @@ def generate(config, report, public_key, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("generate", "check", "prices"))
+    parser.add_argument("action", choices=("generate", "check", "prices", "prerequisites"))
     parser.add_argument("--config", type=Path)
     parser.add_argument("--location", default=PROFILES["defaultLocation"], help="Region for prices (no Azure login required).")
     parser.add_argument("--compute", choices=("cpu", "gpu", "all"), default="all", help="Profile family for prices.")
@@ -616,6 +655,12 @@ def main():
     parser.add_argument("--parameters", type=Path, help="Recheck an existing generated parameter file without upgrading its image.")
     args = parser.parse_args()
     try:
+        if args.action == "prerequisites":
+            if args.config or args.parameters:
+                raise OnboardingError("prerequisites requires neither --config nor --parameters.")
+            report = prerequisites()
+            print(json.dumps(report, indent=2))
+            return 0 if report["azureCli"]["installed"] else 2
         if args.action == "prices":
             if args.config or args.parameters:
                 raise OnboardingError("prices uses --location/--compute, not --config/--parameters.")

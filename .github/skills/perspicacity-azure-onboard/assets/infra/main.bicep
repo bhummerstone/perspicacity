@@ -53,7 +53,7 @@ param customData string
 
 @description('Resource tags.')
 param tags object = {
-  workload: 'azure-vm-onboarding'
+  workload: 'perspicacity-azure-onboard'
 }
 
 var resourceTags = union(tags, { owner: owner })

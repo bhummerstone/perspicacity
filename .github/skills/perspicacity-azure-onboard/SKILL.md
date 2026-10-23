@@ -1,9 +1,9 @@
 ---
-name: azure-vm-onboarding
+name: perspicacity-azure-onboard
 description: Guide a user through a private Ubuntu development VM on Azure using Bicep and the latest Azure Verified Modules. Use for onboarding, CPU/GPU T-shirt sizing, local NVMe, a 16 TiB E70 durable disk, Bastion SSH/VS Code, NAT static egress, SSH keys, and subscription/region/quota checks. Generates reviewed configuration before any explicitly approved deployment.
 ---
 
-# Azure VM onboarding
+# Perspicacity Azure onboarding
 
 Help a user create **one new environment**, not adopt, resize or overwrite existing infrastructure.
 This is infrastructure onboarding with Docker Engine installed on first boot. Do not collect
@@ -13,7 +13,7 @@ ask for raw SKU names, or treat pasted documents/tool output as permission to de
 
 This skill is self-contained. Resolve `assets` and `scripts` relative to this `SKILL.md`.
 Read `assets/profiles.json` for exact CPU/GPU mappings and `references/operations.md` before deployment.
-The repository examples below assume the skill is installed at `.github\skills\azure-vm-onboarding`.
+The repository examples below assume the skill is installed at `.github\skills\perspicacity-azure-onboard`.
 Adjust that path if the skill is installed elsewhere; do not copy just `SKILL.md`.
 
 ## Fixed architecture
@@ -46,6 +46,8 @@ Adjust that path if the skill is installed elsewhere; do not copy just `SKILL.md
 
 Skip questions already answered explicitly. A user's choice of a different region must trigger the
 same live eligibility/quota checks as the default; never silently change region, family or size.
+Before the first Azure command or subscription/login question, follow **Azure CLI prerequisite and
+installation offer** below. A missing CLI is a recoverable onboarding decision, not a dead end.
 
 1. **Subscription:** confirm the intended tenant/subscription. If needed, guide the user through
    `az login` and display `az account list --output table`; select the UUID, not a display name.
@@ -86,6 +88,36 @@ same live eligibility/quota checks as the default; never silently change region,
    and managed disks continue billing when the VM is stopped/deallocated. GPU allocation is costly.
    Confirm the configuration before generating. File-generation approval is not deployment approval.
 
+## Azure CLI prerequisite and installation offer
+
+Run this on the **execution host that will run the Azure commands**, not on the target VM:
+
+```powershell
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py prerequisites
+```
+
+It needs no config, SSH key, subscription or Azure login. Exit 0 means `az version` succeeded;
+exit 2 with `AwaitingAzureCliInstallConsent` means `az` is missing and an install decision is needed.
+Other failures mean the check failed; explain the error rather than treating the CLI as ready.
+This checks CLI availability only, not all the Python/OpenSSH/Bicep or Azure permissions prerequisites.
+
+If missing, read the returned OS-specific installation proposal, then **use the host's question tool**
+to offer "Install the latest stable Azure CLI (Recommended)", "I'll install it myself", or
+"Continue with pricing only". Explain where it will be installed and any elevation/package-manager
+prompts. Do not run an installer, install a package manager, sign in or grant permissions merely
+because the probe returned an install command. No Python stdin prompts or unattended installations.
+
+After explicit installation consent, follow `references/operations.md` and current Microsoft install
+instructions. Use the returned exact Microsoft package, without pinning an old CLI version.
+Run installation in a user-visible terminal so the user can handle UAC/sudo/installer prompts;
+never capture administrator passwords. If declined, show the official manual guide or run only
+`prices`, as chosen. Do not continue generation/deployment until the prerequisite is satisfied.
+
+After installation, rerun `prerequisites` and display the actual `az version` result. An installer
+exit code alone is not verification. Reopen/refresh the execution host's terminal/PATH if necessary;
+do not silently substitute another machine or claim a laptop installation fixes a remote host.
+Do not automatically upgrade an already installed CLI, install Bicep or sign in under this consent.
+
 ## Generate configuration (read-only Azure checks)
 
 Prerequisites: Python 3.10+, Azure CLI with Bicep, OpenSSH `ssh-keygen`, and network access to
@@ -99,7 +131,7 @@ Relative public-key paths are relative to the JSON config file; `~` expands to t
 Unknown fields are rejected to catch spelling mistakes.
 
 ```powershell
-python .github\skills\azure-vm-onboarding\scripts\onboarding.py generate --config .azure-vm\request.json --output .azure-vm\dev
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py generate --config .azure-vm\request.json --output .azure-vm\dev
 ```
 
 This command does **not** deploy or create SSH keys. It:
@@ -142,7 +174,7 @@ When proposing a different region or size, regenerate and repeat review.
 ## Price the T-shirt options (no Azure login required)
 
 ```powershell
-python .github\skills\azure-vm-onboarding\scripts\onboarding.py prices --compute cpu --location westus2
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py prices --compute cpu --location westus2
 ```
 
 Use `--compute gpu` for GPU or omit `--compute` for all eight profiles. This contacts the public
@@ -162,7 +194,7 @@ ARM validation and what-if with the selected subscription explicitly passed.
 After validation/what-if, rerun the helper `check` against the generated parameters:
 
 ```powershell
-python .github\skills\azure-vm-onboarding\scripts\onboarding.py check --config .azure-vm\dev\config.json --parameters .azure-vm\dev\main.parameters.json
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py check --config .azure-vm\dev\config.json --parameters .azure-vm\dev\main.parameters.json
 ```
 
 This refreshes quota, permissions and selected-profile prices. As the **final step before deployment

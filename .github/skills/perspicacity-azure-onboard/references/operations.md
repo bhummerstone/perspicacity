@@ -5,6 +5,41 @@ Commands are PowerShell examples. Replace placeholders with the approved values 
 The CLI helper only performs read operations; every mutation below needs explicit user authorization.
 This is a new-environment flow, not an existing infrastructure migration or in-place resize tool.
 
+## Missing Azure CLI: offer installation
+
+Run `onboarding.py prerequisites` before subscription/login questions. It only locates `az` and,
+when present, calls `az version` without authentication. Missing CLI produces a structured install
+proposal and exit 2 (`AwaitingAzureCliInstallConsent`), not automatic installation. The agent must
+ask the user whether to install the latest stable CLI, install manually, or continue with pricing only.
+
+Use the installer on the execution host, not inside the new VM. After explicit approval:
+
+- **Windows:** if WinGet is present, use
+  `winget install --exact --id Microsoft.AzureCLI --source winget`. No `--version` pin is applied.
+  Let the user answer package/source agreements and UAC prompts; do not silently accept them.
+  If WinGet is absent, use Microsoft's signed MSI from the
+  [official Windows guide](https://learn.microsoft.com/cli/azure/install-azure-cli-windows).
+  Review the installer signature/publisher; do not install WinGet or use an arbitrary mirror as a fallback.
+- **macOS:** if Homebrew is present, run `brew update` then `brew install azure-cli`, stopping if
+  either fails. See the [official macOS guide](https://learn.microsoft.com/cli/azure/install-azure-cli-macos).
+  If Homebrew is missing, discuss the additional installation separately; do not bootstrap it automatically.
+- **Linux/WSL:** identify the actual distribution/version and use the matching Microsoft package
+  repository and instructions from the
+  [official Linux guide](https://learn.microsoft.com/cli/azure/install-azure-cli-linux).
+  Show the distribution-specific plan before asking for installation consent. Do not assume apt
+  on all Linux hosts, use an obsolete distro package, or pipe a downloaded script straight into a shell.
+
+Run approved installers in a visible, user-owned terminal, not a background command that can hang
+on a password or elevation prompt. Report package-manager/network/signature errors without
+claiming completion or trying an unapproved fallback. If installation is declined, pause onboarding
+with the manual guide or allow `prices` only; pricing does not need Azure CLI.
+Installation consent does not authorize Azure login, Bicep/extensions, upgrades of an existing CLI,
+provider/feature registration or billable infrastructure.
+
+Reopen/refresh the terminal's PATH if needed, then rerun `onboarding.py prerequisites`. Require
+successful `az version` output from the same execution host before resuming subscription/login
+questions. Record/display the actual installed version, not a hardcoded "latest" version number.
+
 ## Review and deploy
 
 The generated `main.parameters.json` contains only a public SSH key, never a private key or password.
@@ -79,7 +114,7 @@ $resourceGroup = '<approved resource group>'
 $location = 'westus2' # Replace with the approved override if applicable.
 $owner = '<approved owner/team label>'
 
-az group create --subscription $subscription --name $resourceGroup --location $location --tags "owner=$owner" workload=azure-vm-onboarding
+az group create --subscription $subscription --name $resourceGroup --location $location --tags "owner=$owner" workload=perspicacity-azure-onboard
 az deployment group validate --subscription $subscription --resource-group $resourceGroup --template-file .azure-vm\dev\infra\main.bicep --parameters '@.azure-vm\dev\main.parameters.json'
 az deployment group what-if --subscription $subscription --resource-group $resourceGroup --template-file .azure-vm\dev\infra\main.bicep --parameters '@.azure-vm\dev\main.parameters.json'
 ```

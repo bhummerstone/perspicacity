@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL = ROOT / ".github" / "skills" / "azure-vm-onboarding"
+SKILL = ROOT / ".github" / "skills" / "perspicacity-azure-onboard"
 SPEC = importlib.util.spec_from_file_location("onboarding", SKILL / "scripts" / "onboarding.py")
 onboarding = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(onboarding)
@@ -51,6 +51,78 @@ def sku_for(config):
             {"name": "EncryptionAtHostSupported", "value": "True"},
         ],
     }
+
+
+class PrerequisiteTests(unittest.TestCase):
+    def probe(self, platform, tools=(), version="2.99.0"):
+        with patch.object(onboarding.sys, "platform", platform), patch.object(
+            onboarding.shutil, "which", side_effect=lambda name: name if name in tools else None
+        ), patch.object(onboarding, "az", return_value={"azure-cli": version}) as azure:
+            report = onboarding.prerequisites()
+        if "az" in tools:
+            azure.assert_called_once_with("version")
+        else:
+            azure.assert_not_called()
+        return report
+
+    def test_installed_cli_is_verified_without_login_or_upgrade(self):
+        report = self.probe("win32", ("az",))
+        self.assertEqual(report, {
+            "status": "AzureCliReady", "azureCli": {"installed": True, "version": "2.99.0"},
+        })
+        for version in ("", None):
+            with self.subTest(version=version), self.assertRaises(onboarding.OnboardingError):
+                self.probe("win32", ("az",), version)
+
+    def test_missing_windows_cli_proposes_latest_exact_package_without_installing(self):
+        with patch.object(onboarding, "command", side_effect=AssertionError("Must not install")):
+            report = self.probe("win32", ("winget",))
+        self.assertEqual(report["status"], "AwaitingAzureCliInstallConsent")
+        self.assertTrue(report["installation"]["requiresConsent"])
+        self.assertEqual(report["installation"]["commands"], [
+            ["winget", "install", "--exact", "--id", "Microsoft.AzureCLI", "--source", "winget"],
+        ])
+        self.assertIn("question tool", report["nextStep"])
+
+    def test_missing_package_manager_requires_official_guidance_not_automatic_bootstrap(self):
+        for platform, suffix in (("win32", "-windows"), ("darwin", "-macos"), ("linux", "-linux"), ("unknown", "")):
+            with self.subTest(platform=platform):
+                report = self.probe(platform)
+                self.assertEqual(report["installation"]["commands"], [])
+                self.assertEqual(report["installation"]["documentation"],
+                                 "https://learn.microsoft.com/cli/azure/install-azure-cli" + suffix)
+
+    def test_mac_proposes_brew_update_then_latest_install(self):
+        report = self.probe("darwin", ("brew",))
+        self.assertEqual(report["installation"]["commands"], [
+            ["brew", "update"], ["brew", "install", "azure-cli"],
+        ])
+
+    def test_prerequisites_action_needs_no_config_or_key_and_reports_pending_consent(self):
+        for installed in (False, True):
+            with self.subTest(installed=installed), patch(
+                "sys.argv", ["onboarding.py", "prerequisites"]
+            ), patch.object(onboarding, "prerequisites", return_value={"azureCli": {"installed": installed}}), patch.object(
+                onboarding, "read_config", side_effect=AssertionError("Must not need config")
+            ), patch.object(onboarding, "read_public_key", side_effect=AssertionError("Must not need key")), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(onboarding.main(), 0 if installed else 2)
+                self.assertEqual(json.loads(output.getvalue())["azureCli"]["installed"], installed)
+
+    def test_broken_cli_surfaces_error_and_is_not_reinstalled(self):
+        with patch("sys.argv", ["onboarding.py", "prerequisites"]), patch.object(
+            onboarding.shutil, "which", return_value="az"
+        ), patch.object(onboarding, "az", side_effect=onboarding.OnboardingError("CLI failed")), redirect_stdout(
+            io.StringIO()
+        ) as output, redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(onboarding.main(), 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("CLI failed", error.getvalue())
+
+    def test_direct_missing_az_error_explains_install_consent_and_recovery(self):
+        with patch.object(onboarding.shutil, "which", return_value=None), patch.object(
+            onboarding.subprocess, "run", side_effect=AssertionError("Must not install")
+        ), self.assertRaisesRegex(onboarding.OnboardingError, "permission.*prerequisites"):
+            onboarding.command(["az", "account", "show"])
 
 
 class NetworkTests(unittest.TestCase):
