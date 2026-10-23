@@ -145,7 +145,9 @@ python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py check --c
 **Availability and quota are checked for every region, including the default.** Insufficient quota,
 SKU restrictions, image incompatibility or missing permissions stop the flow. Sufficient quota does
 not guarantee physical capacity; ARM validation/what-if and user confirmation are still required.
-The helper reports overlapping Azure VNets; the user must also check LAN/VPN/peering address overlap.
+Access is through Bastion, with no VPN or VNet peering. Onboarding does not ask about or check
+overlap with home or other networks; it still validates CIDR alignment, subnet containment and
+non-overlap between the Bastion and VM subnets.
 
 See [operations](.github/skills/perspicacity-azure-onboard/references/operations.md) for deployment gates,
 Bastion tunneling, VS Code, GPU verification and safe disk handling.

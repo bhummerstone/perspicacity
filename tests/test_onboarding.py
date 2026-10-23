@@ -366,10 +366,10 @@ class PreflightTests(unittest.TestCase):
         self.region_code = "westus2"
         self.group_resources = []
         self.provider_region = "West US 2"
-        self.vnets = []
         self.feature_state = "Registered"
         self.permission_entries = [{"actions": ["*"], "notActions": []}]
         self.permission_urls = []
+        self.location_urls = []
         self.group_exists = False
 
     def azure(self, *args, subscription=None):
@@ -380,8 +380,6 @@ class PreflightTests(unittest.TestCase):
             return {"name": "AzureCloud"}
         if route == ("account", "show"):
             return {"state": "Enabled"}
-        if route == ("account", "list-locations"):
-            return [{"name": self.region_code, "displayName": self.region}]
         if route == ("provider", "show"):
             return {
                 "registrationState": "Registered",
@@ -396,6 +394,10 @@ class PreflightTests(unittest.TestCase):
         if route == ("group", "exists"):
             return self.group_exists or bool(self.group_resources)
         if route == ("rest", "--method"):
+            if "/locations?" in args[4]:
+                self.assertEqual(args[2:4], ("get", "--url"))
+                self.location_urls.append(args[4])
+                return {"value": [{"name": self.region_code, "displayName": self.region}]}
             self.permission_urls.append(args[4])
             return {"value": self.permission_entries}
         if route == ("resource", "list"):
@@ -406,8 +408,6 @@ class PreflightTests(unittest.TestCase):
             return self.vm_usage
         if route == ("network", "list-usages"):
             return self.network_usage
-        if args[:3] == ("network", "vnet", "list"):
-            return self.vnets
         self.fail(f"Unexpected Azure command: {args}")
 
     def run_check(self, config=None):
@@ -428,6 +428,12 @@ class PreflightTests(unittest.TestCase):
             "enabled": True, "keyManagement": "PlatformManaged",
             "subscriptionFeatureState": "Registered", "skuSupported": True,
         })
+
+    def test_locations_use_subscription_scoped_arm_endpoint(self):
+        self.run_check()
+        self.assertEqual(self.location_urls, [
+            f"https://management.azure.com/subscriptions/{CONFIG['subscriptionId']}/locations?api-version=2022-12-01"
+        ])
 
     def test_unregistered_pending_or_unknown_host_encryption_feature_blocks(self):
         for state in ("NotRegistered", "Registering", "Unregistering", None):
@@ -517,9 +523,13 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(onboarding.OnboardingError, "public IP quota"):
             self.run_check()
 
-    def test_overlapping_existing_vnets_are_reported_not_hidden(self):
-        self.vnets = [{"id": "/existing/vnet", "addressSpace": {"addressPrefixes": ["192.168.0.0/16"]}}]
-        self.assertEqual(self.run_check()["overlappingVnets"], ["/existing/vnet"])
+    def test_bastion_only_preflight_does_not_query_other_vnets(self):
+        with patch.object(onboarding, "az", side_effect=self.azure) as azure, patch.object(
+            onboarding, "resolve_image", return_value=IMAGE
+        ):
+            report = onboarding.preflight(CONFIG)
+        self.assertFalse(any(call.args[:3] == ("network", "vnet", "list") for call in azure.call_args_list))
+        self.assertNotIn("overlappingVnets", report)
 
 
 class GenerationTests(unittest.TestCase):

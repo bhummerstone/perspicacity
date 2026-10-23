@@ -470,7 +470,11 @@ def preflight(config, pinned_image=None):
     account = az("account", "show", subscription=subscription)
     if account["state"] != "Enabled":
         raise OnboardingError("The selected subscription is not enabled.")
-    regions = az("account", "list-locations", subscription=subscription)
+    regions = az(
+        "rest", "--method", "get", "--url",
+        f"https://management.azure.com/subscriptions/{subscription}/locations?api-version=2022-12-01",
+        subscription=subscription,
+    )["value"]
     region = next((region for region in regions if region["name"] == location), None)
     if region is None:
         raise OnboardingError(f"{location} is not an available subscription region.")
@@ -529,13 +533,6 @@ def preflight(config, pinned_image=None):
     if not any("publicip" in name.lower() for name in requirements):
         raise OnboardingError("Azure did not return public IP quota; verify Standard public IP headroom before retrying.")
     quotas.extend(check_quota(network_usages, requirements))
-    existing_vnets = az("network", "vnet", "list", subscription=subscription)
-    network = validate_networks(config)["vnetCidr"]
-    overlaps = [
-        vnet["id"] for vnet in existing_vnets
-        if any(network.overlaps(ipaddress.ip_network(cidr))
-               for cidr in vnet["addressSpace"]["addressPrefixes"] if ":" not in cidr)
-    ]
     image = resolve_image(config, pinned_image)
     return {
         "checkedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -553,11 +550,10 @@ def preflight(config, pinned_image=None):
             "skuSupported": True,
         },
         "quotaChecks": quotas,
-        "overlappingVnets": overlaps,
         "limitations": [
             "Quota and SKU eligibility do not reserve physical capacity.",
             "Only network quota counters returned by Azure were checked; deployment validation is still required.",
-            "Local/VPN address overlap, deny assignments/conditional access, Azure Policy and billing restrictions require separate review and ARM validation.",
+            "Deny assignments/conditional access, Azure Policy and billing restrictions require separate review and ARM validation.",
             "Disk capacity and service-specific limits are finally checked by ARM validation/allocation.",
         ],
     }

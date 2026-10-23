@@ -77,10 +77,10 @@ installation offer** below. A missing CLI is a recoverable onboarding decision, 
    overwrite keys, read a private key, or put one in parameters, logs, artifacts or Git.
    Existing RSA keys must be at least 2048 bits (4096 recommended). The matching private key will
    be needed locally for connection, but its contents must never be requested.
-7. **IP addressing:** offer the defaults. Ask whether they overlap a local LAN, VPN, or intended
-   peered network. `192.168.0.0/24` commonly overlaps home networks. If changing the VNet, also
-   recalculate both subnets. The helper checks private IPv4 alignment, containment and non-overlap;
-   it reports overlapping Azure VNets but cannot see every LAN/VPN or other subscription.
+7. **IP addressing:** use the defaults unless the user requests different CIDRs; do not ask about
+   home/LAN/VPN or other VNet overlap. This is an isolated development VNet accessed through
+   Bastion, with no VPN or peering. If changing the VNet, also recalculate both subnets.
+   The helper checks private IPv4 alignment, subnet containment and non-overlap between the two subnets.
 8. **Review:** show subscription, owner, selected SKU, image policy, region, CIDRs, access method,
    keys (public-key path only), disks, first-boot Docker/GPU software and ongoing costs.
    E70 provisions **16 TiB even on Small**.
@@ -167,7 +167,7 @@ requests. Do not auto-request quota, choose a smaller profile, downgrade the ima
 that sufficient quota guarantees physical capacity. A provider's advertised region list does not
 guarantee every SKU/API combination; ARM validation and allocation remain necessary.
 
-Read and explain warnings, including overlapping VNets and any limits not exposed by the API.
+Read and explain warnings, including any limits not exposed by the API.
 Review policy/permissions with ARM validation; the helper is not an exhaustive policy audit.
 When proposing a different region or size, regenerate and repeat review.
 
