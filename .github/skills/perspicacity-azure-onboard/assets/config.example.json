@@ -4,6 +4,7 @@
   "namePrefix": "perspicacity",
   "compute": "cpu",
   "size": "small",
+  "vmSize": "auto",
   "location": "westus2",
   "adminUsername": "azureuser",
   "owner": "research-team",

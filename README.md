@@ -24,12 +24,24 @@ The VM has no public IP; NAT supplies a static outbound IP. SSH keys stay local;
 
 ## Compute and storage
 
-| Size | CPU SKU | vCPU / RAM | Local NVMe devices / total |
-|---|---|---|---|
-| Small | `Standard_D16ds_v7` | 16 / 64 GiB | 2 x 440 GiB / 880 GiB |
-| Medium | `Standard_D32ds_v7` | 32 / 128 GiB | 4 x 440 GiB / 1,760 GiB |
-| Large | `Standard_D64ds_v7` | 64 / 256 GiB | 4 x 880 GiB / 3,520 GiB |
-| XL | `Standard_D128ds_v7` | 128 / 512 GiB | 4 x 1,760 GiB / 7,040 GiB |
+| Size | CPU vCPU / RAM | Local NVMe devices / total |
+|---|---|---|
+| Small | 16 / 64 GiB | 2 x 440 GiB / 880 GiB |
+| Medium | 32 / 128 GiB | 4 x 440 GiB / 1,760 GiB |
+| Large | 64 / 256 GiB | 4 x 880 GiB / 3,520 GiB |
+| XL | 128 / 512 GiB | 4 x 1,760 GiB / 7,040 GiB |
+
+CPU automatically considers **Intel Ddsv6/Ddsv7 and AMD Dadsv6/Dadsv7** at the chosen size:
+`Standard_D{vCPU}ds_v6`, `Standard_D{vCPU}ds_v7`, `Standard_D{vCPU}ads_v6` and
+`Standard_D{vCPU}ads_v7`. AMD v6 has no 128-vCPU SKU, so XL has three candidates.
+The helper excludes unavailable/restricted SKUs, incompatible capabilities and insufficient/unknown
+quota. It ranks by effective available vCPUs (minimum of regional and family headroom), then family
+headroom, newer generation, then catalog order (Intel before AMD within a generation).
+Headroom is limit minus current usage, not the limit alone. This is quota-based, not a cheapest-price
+or performance ranking; vendor/generation performance can differ despite equal capacity.
+The selected SKU, processor/generation, quota evidence and its actual price are shown for review.
+The exact SKU is pinned in generated config/parameters and rechecked without silently switching
+families. It never shrinks the T-shirt or changes region to bypass quota.
 
 | Size | GPU SKU | vCPU / RAM | GPU / VRAM | Total local NVMe |
 |---|---|---|---|---|
@@ -62,7 +74,10 @@ Cloud-init may still be running after Azure reports VM provisioning success. Req
 `sudo cloud-init status --wait`, Docker daemon/plugin checks and (for GPU) `nvidia-smi` before claiming
 readiness; see [operations](.github/skills/perspicacity-azure-onboard/references/operations.md).
 
-Sources: [CPU specifications](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv7-series),
+Sources: [Intel v7](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv7-series),
+[Intel v6](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv6-series),
+[AMD v7](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/dadsv7-series),
+[AMD v6](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/dadsv6-series),
 [GPU specifications](https://learn.microsoft.com/azure/virtual-machines/sizes/gpu-accelerated/nc-rtxpro6000-bse-v6-series),
 [GPU OS support](https://learn.microsoft.com/azure/virtual-machines/sizes/gpu-accelerated/nc-rtxpro6000-bse-v6-series-overview),
 [managed disk types](https://learn.microsoft.com/azure/virtual-machines/disks-types).
@@ -75,11 +90,22 @@ Fetch current USD Linux PAYG prices without signing into Azure or providing a ke
 python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py prices --location westus2
 ```
 
-Add `--compute cpu` or `--compute gpu` to show one family. The skill shows these costs alongside
+Add `--compute cpu` or `--compute gpu` to show one mode. Without a subscription, CPU pricing
+covers all 15 catalog candidates, not one assumed winner per T-shirt; this requires no Azure login.
+For the interactive flow, supply the confirmed subscription to select quota-eligible SKUs first:
+
+```powershell
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py prices --compute cpu --location westus2 --subscription <subscription-UUID>
+```
+
+This needs Azure login but no SSH keys. It prices one selected SKU per eligible T-shirt and
+discloses unavailable sizes/reasons in `skuSelection`; those sizes must not be offered as deployable.
+If none qualify, it fails without a fabricated price. Generation still runs full preflight.
+The skill shows these costs alongside
 the T-shirt specifications, then refreshes the selected profile at generation and again as the
 final step before deployment approval. Missing or ambiguous prices block the flow.
 
-**Example snapshot: West US 2, 23 October 2026, USD PAYG, 730 VM hours/month.**
+**Example snapshot: West US 2, 23 October 2026, USD PAYG, 730 VM hours/month. CPU rates are Intel Ddsv7 only.**
 Monthly figures include the VM, both disks, Bastion Standard, NAT and two static public IPv4s;
 they exclude usage-based charges and taxes. Rerun the command; this table is not a live quote.
 
@@ -124,6 +150,10 @@ The required `owner` is a resource tag, not a role assignment. Older requests ne
 regenerated/reviewed parameters. The helper accepts only new/empty resource groups and never changes
 the active subscription or grants roles. It checks the caller's reported actions at subscription scope
 for a new group, or at an existing empty group's scope; deny assignments and policy still require ARM validation.
+`vmSize` defaults to `auto` for quota-based selection. In the interactive flow, replace it with the
+exact SKU reviewed in the priced size step before generation. Generated `config.json` always pins
+the resolved `vmSize`; final `check --parameters` refuses older output without that pin and never
+reselects a different variant. Regenerate/review if the pinned SKU no longer qualifies.
 
 ```powershell
 python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py generate --config .azure-vm\request.json --output .azure-vm\dev

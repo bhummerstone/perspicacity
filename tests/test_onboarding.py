@@ -20,6 +20,7 @@ SPEC.loader.exec_module(onboarding)
 
 CONFIG = {
     **onboarding.DEFAULTS,
+    "vmSize": "Standard_D16ds_v7",
     "subscriptionId": "11111111-1111-4111-8111-111111111111",
     "resourceGroup": "rg-test",
     "namePrefix": "test-vm",
@@ -37,8 +38,12 @@ def usage(name, current=0, limit=1000):
     return {"name": {"value": name}, "currentValue": current, "limit": limit}
 
 
-def sku_for(config):
-    profile = onboarding.PROFILES[config["compute"]][config["size"]]
+def reference_profiles(compute):
+    return {size: onboarding.profile_candidates(compute, size)[0] for size in onboarding.PROFILES[compute]}
+
+
+def sku_for(config, profile=None):
+    profile = profile or reference_profiles(config["compute"])[config["size"]]
     return {
         "name": profile["sku"],
         "family": "testFamily",
@@ -47,6 +52,7 @@ def sku_for(config):
             {"name": "HyperVGenerations", "value": "V1,V2"},
             {"name": "CpuArchitectureType", "value": "x64"},
             {"name": "vCPUs", "value": str(profile["vcpus"])},
+            {"name": "MemoryGB", "value": str(profile["memoryGiB"])},
             {"name": "DiskControllerTypes", "value": "SCSI,NVMe"},
             {"name": "EncryptionAtHostSupported", "value": "True"},
         ],
@@ -170,6 +176,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["location"], "westus2")
         self.assertEqual(config["size"], "small")
         self.assertEqual(config["compute"], "cpu")
+        self.assertEqual(config["vmSize"], "auto")
 
     def test_relative_public_key_path_is_relative_to_config(self):
         config = self.read({"sshPublicKeyPath": "keys/test.pub"})
@@ -189,6 +196,9 @@ class ConfigTests(unittest.TestCase):
             {"namePrefix": "../bad"},
             {"size": "xxl"},
             {"compute": "accelerator"},
+            {"vmSize": "Standard_D16s_v7"},
+            {"vmSize": "Standard_D32ds_v7"},
+            {"vmSize": "Standard_D16ds_v5"},
             {"sshPublicKeyPath": None},
             {"owner": ""},
             {"owner": " team"},
@@ -234,7 +244,12 @@ class ProfileTests(unittest.TestCase):
             ("large", 64, 4, 880, 3520), ("xl", 128, 4, 1760, 7040),
         ):
             profile = onboarding.PROFILES["cpu"][size]
-            self.assertEqual(profile["sku"], f"Standard_D{cpus}ds_v7")
+            candidates = onboarding.profile_candidates("cpu", size)
+            self.assertEqual(candidates[0]["sku"], f"Standard_D{cpus}ds_v7")
+            expected = {f"Standard_D{cpus}{suffix}" for suffix in ("ds_v7", "ads_v7", "ds_v6", "ads_v6")}
+            if size == "xl":
+                expected.remove("Standard_D128ads_v6")
+            self.assertEqual({candidate["sku"] for candidate in candidates}, expected)
             self.assertEqual(profile["memoryGiB"], cpus * 4)
             self.assertEqual((profile["nvmeDevices"], profile["nvmeGiBPerDevice"]), (count, per_disk))
             self.assertEqual(count * per_disk, total)
@@ -254,27 +269,27 @@ class ProfileTests(unittest.TestCase):
             for size in ("small", "medium", "large", "xl"):
                 config = {**CONFIG, "compute": compute, "size": size}
                 sku = sku_for(config)
-                self.assertEqual(onboarding.select_sku([sku], config), sku)
+                self.assertEqual(onboarding.select_sku([sku], config, reference_profiles(compute)[size]), sku)
 
     def test_location_restrictions_fail_but_zone_only_restrictions_do_not(self):
         sku = sku_for(CONFIG)
         sku["restrictions"] = [{"type": "Location", "reasonCode": "NotAvailableForSubscription"}]
         with self.assertRaisesRegex(onboarding.OnboardingError, "restricted"):
-            onboarding.select_sku([sku], CONFIG)
+            onboarding.select_sku([sku], CONFIG, reference_profiles("cpu")["small"])
         sku["restrictions"] = [{"type": "Zone", "reasonCode": "NotAvailableForSubscription"}]
-        self.assertEqual(onboarding.select_sku([sku], CONFIG), sku)
+        self.assertEqual(onboarding.select_sku([sku], CONFIG, reference_profiles("cpu")["small"]), sku)
 
     def test_missing_or_changed_sku_capabilities_fail(self):
         with self.assertRaisesRegex(onboarding.OnboardingError, "not offered"):
-            onboarding.select_sku([], CONFIG)
+            onboarding.select_sku([], CONFIG, reference_profiles("cpu")["small"])
         for name, value in (("HyperVGenerations", "V1"), ("CpuArchitectureType", "Arm64"),
-                            ("vCPUs", "32"), ("DiskControllerTypes", "SCSI")):
+                            ("vCPUs", "32"), ("MemoryGB", "128"), ("DiskControllerTypes", "SCSI")):
             sku = sku_for(CONFIG)
             for cap in sku["capabilities"]:
                 if cap["name"] == name:
                     cap["value"] = value
             with self.subTest(name=name), self.assertRaises(onboarding.OnboardingError):
-                onboarding.select_sku([sku], CONFIG)
+                onboarding.select_sku([sku], CONFIG, reference_profiles("cpu")["small"])
 
     def test_host_encryption_support_is_required_for_every_profile(self):
         for compute in ("cpu", "gpu"):
@@ -290,12 +305,12 @@ class ProfileTests(unittest.TestCase):
                     with self.subTest(compute=compute, size=size, capability=value), self.assertRaisesRegex(
                         onboarding.OnboardingError, "EncryptionAtHostSupported=True"
                     ):
-                        onboarding.select_sku([sku], config)
+                        onboarding.select_sku([sku], config, reference_profiles(compute)[size])
 
     def test_host_encryption_capability_value_is_case_insensitive(self):
         sku = sku_for(CONFIG)
         next(cap for cap in sku["capabilities"] if cap["name"] == "EncryptionAtHostSupported")["value"] = "true"
-        self.assertEqual(onboarding.select_sku([sku], CONFIG), sku)
+        self.assertEqual(onboarding.select_sku([sku], CONFIG, reference_profiles("cpu")["small"]), sku)
 
 
 class QuotaTests(unittest.TestCase):
@@ -311,6 +326,136 @@ class QuotaTests(unittest.TestCase):
     def test_zero_gpu_family_quota_is_not_ignored(self):
         with self.assertRaisesRegex(onboarding.OnboardingError, "Insufficient"):
             onboarding.check_quota([usage("gpuFamily", 0, 0)], {"gpuFamily": 36})
+
+
+class CpuSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.config = {**CONFIG, "vmSize": "auto"}
+        self.profiles = onboarding.profile_candidates("cpu", "small")
+        self.skus = [
+            {**sku_for(self.config, profile), "family": f"family{index}"}
+            for index, profile in enumerate(self.profiles)
+        ]
+        self.usages = [usage("cores", 0, 1000), usage("virtualMachines", 0, 100)]
+        self.usages.extend(usage(f"family{index}", 0, 100) for index in range(4))
+
+    def choose(self, config=None):
+        return onboarding.select_compute(config or self.config, self.skus, self.usages)
+
+    def test_each_intel_amd_v6_v7_variant_can_win_on_available_family_quota(self):
+        for index, candidate in enumerate(self.profiles):
+            with self.subTest(sku=candidate["sku"]):
+                row = self.usages[2 + index]
+                row["limit"] = 200
+                profile, checks, report = self.choose()
+                self.assertEqual(profile, candidate)
+                self.assertEqual(checks[1]["name"], f"family{index}")
+                self.assertEqual(report["mode"], "QuotaRanked")
+                self.assertEqual(report["selectedSku"], candidate["sku"])
+                self.assertEqual(len(report["candidates"]), 4)
+                row["limit"] = 100
+
+    def test_usage_not_limit_alone_determines_winner(self):
+        self.usages[2] = usage("family0", 199, 200)
+        self.usages[3] = usage("family1", 10, 100)
+        self.usages[4] = usage("family2", 0, 150)
+        profile, _, report = self.choose()
+        self.assertEqual(profile["sku"], "Standard_D16ds_v6")
+        self.assertEqual(report["candidates"][0]["status"], "Unavailable")
+        self.assertEqual(report["candidates"][2]["effectiveAvailableVcpus"], 150)
+
+    def test_regional_cap_then_family_headroom_then_generation_and_stable_order_break_ties(self):
+        self.usages[0]["limit"] = 16
+        self.usages[4]["limit"] = 101
+        profile, _, report = self.choose()
+        self.assertEqual(profile["generation"], 6)
+        self.assertTrue(all(entry["effectiveAvailableVcpus"] == 16 for entry in report["candidates"]))
+        self.usages[4]["limit"] = 100
+        for sku in self.skus:
+            sku["capabilities"] = list(reversed(sku["capabilities"]))
+        self.skus.reverse()
+        self.assertEqual(self.choose()[0]["sku"], "Standard_D16ds_v7")
+        self.usages[2]["limit"] = 0
+        self.assertEqual(self.choose()[0]["sku"], "Standard_D16ads_v7")
+
+    def test_restricted_missing_incompatible_and_insufficient_candidates_are_explained(self):
+        self.skus[0]["restrictions"] = [{"type": "Location", "reasonCode": "NotAvailableForSubscription"}]
+        self.skus.pop(1)
+        self.usages[4]["limit"] = 0
+        profile, _, report = self.choose()
+        self.assertEqual(profile["sku"], "Standard_D16ads_v6")
+        reasons = {entry["sku"]: entry.get("reason", "") for entry in report["candidates"]}
+        self.assertIn("restricted", reasons["Standard_D16ds_v7"])
+        self.assertIn("not offered", reasons["Standard_D16ads_v7"])
+        self.assertIn("Insufficient", reasons["Standard_D16ds_v6"])
+
+    def test_security_and_hardware_requirements_are_not_relaxed_to_get_more_quota(self):
+        for name, value in (
+            ("EncryptionAtHostSupported", "False"), ("HyperVGenerations", "V1"),
+            ("CpuArchitectureType", "Arm64"), ("DiskControllerTypes", "SCSI"),
+            ("vCPUs", "8"), ("MemoryGB", "32"), ("TrustedLaunchDisabled", "True"),
+        ):
+            with self.subTest(capability=name):
+                skus = copy.deepcopy(self.skus)
+                skus[0]["capabilities"] = [
+                    cap for cap in skus[0]["capabilities"] if cap["name"] != name
+                ] + [{"name": name, "value": value}]
+                self.usages[2]["limit"] = 10000
+                profile, _, report = onboarding.select_compute(self.config, skus, self.usages)
+                self.assertEqual(profile["sku"], "Standard_D16ads_v7")
+                self.assertEqual(report["candidates"][0]["status"], "Unavailable")
+
+    def test_unknown_family_quota_is_not_assumed_unlimited(self):
+        self.usages = self.usages[:2] + self.usages[3:]
+        profile, _, report = self.choose()
+        self.assertEqual(profile["sku"], "Standard_D16ads_v7")
+        self.assertIn("not returned", report["candidates"][0]["reason"])
+
+    def test_exact_thresholds_and_case_insensitive_quota_names(self):
+        self.usages = [usage("CORES", 84, 100), usage("VIRTUALMACHINES", 99, 100), usage("FAMILY3", 84, 100)]
+        self.assertEqual(self.choose()[0]["sku"], "Standard_D16ads_v6")
+        self.usages[-1]["currentValue"] = 85
+        with self.assertRaisesRegex(onboarding.OnboardingError, "No eligible"):
+            self.choose()
+
+    def test_regional_and_vm_count_limits_cannot_be_bypassed_by_switching_family(self):
+        for row in self.usages[:2]:
+            limit = row["limit"]
+            row["limit"] = 0
+            with self.subTest(quota=row["name"]["value"]), self.assertRaisesRegex(
+                onboarding.OnboardingError, f"Insufficient {row['name']['value']} quota"
+            ):
+                self.choose()
+            row["limit"] = limit
+
+    def test_pinned_sku_is_rechecked_not_replaced_when_other_family_is_better(self):
+        config = {**self.config, "vmSize": "Standard_D16ads_v6"}
+        profile, _, report = self.choose(config)
+        self.assertEqual(profile["sku"], config["vmSize"])
+        self.assertEqual(report["mode"], "Pinned")
+        self.assertEqual(len(report["candidates"]), 1)
+        self.usages[-1]["limit"] = 0
+        with self.assertRaisesRegex(onboarding.OnboardingError, "No eligible"):
+            self.choose(config)
+
+    def test_xl_never_invents_unsupported_amd_v6_size_or_downsizes(self):
+        config = {**self.config, "size": "xl"}
+        candidates = onboarding.profile_candidates("cpu", "xl")
+        self.assertEqual(len(candidates), 3)
+        self.assertTrue(all(profile["vcpus"] == 128 and profile["memoryGiB"] == 512 for profile in candidates))
+        with self.assertRaisesRegex(onboarding.OnboardingError, "No eligible"):
+            self.choose(config)
+        with self.assertRaisesRegex(onboarding.OnboardingError, "exact catalog SKU"):
+            self.choose({**config, "vmSize": "Standard_D128ads_v6"})
+
+    def test_gpu_keeps_its_existing_exact_profile(self):
+        config = {**self.config, "compute": "gpu"}
+        sku = sku_for(config)
+        profile, _, report = onboarding.select_compute(
+            config, [sku], [usage("cores"), usage("testFamily"), usage("virtualMachines")]
+        )
+        self.assertEqual(profile, onboarding.PROFILES["gpu"]["small"])
+        self.assertEqual(len(report["candidates"]), 1)
 
 
 class ImageTests(unittest.TestCase):
@@ -448,7 +593,7 @@ class PreflightTests(unittest.TestCase):
         self.region_code = "eastus"
         self.region = self.provider_region = "East US"
         for compute in ("cpu", "gpu"):
-            config = {**CONFIG, "location": "eastus", "compute": compute}
+            config = {**CONFIG, "location": "eastus", "compute": compute, "vmSize": "auto"}
             self.sku = sku_for(config)
             self.feature_state = "Registering"
             with self.subTest(compute=compute), self.assertRaisesRegex(
@@ -534,7 +679,10 @@ class PreflightTests(unittest.TestCase):
 
 class GenerationTests(unittest.TestCase):
     def report(self):
-        return {"imageReference": IMAGE, "quotaChecks": [], "costEstimate": {"fixture": True}}
+        return {
+            "imageReference": IMAGE, "profile": reference_profiles("cpu")["small"],
+            "quotaChecks": [], "costEstimate": {"fixture": True},
+        }
 
     def test_template_requires_host_encryption_without_additional_resources(self):
         template = (onboarding.ASSETS / "infra" / "main.bicep").read_text(encoding="utf-8")
@@ -546,9 +694,9 @@ class GenerationTests(unittest.TestCase):
     def test_parameters_match_all_eight_profiles_and_only_public_key(self):
         for compute in ("cpu", "gpu"):
             for size in ("small", "medium", "large", "xl"):
-                config = {**CONFIG, "compute": compute, "size": size}
+                config = {**CONFIG, "compute": compute, "size": size, "vmSize": reference_profiles(compute)[size]["sku"]}
                 values = onboarding.parameters(config, IMAGE, PUBLIC_KEY)["parameters"]
-                self.assertEqual(values["vmSize"]["value"], onboarding.PROFILES[compute][size]["sku"])
+                self.assertEqual(values["vmSize"]["value"], reference_profiles(compute)[size]["sku"])
                 self.assertEqual(values["imageReference"]["value"], IMAGE)
                 self.assertIs(values["encryptionAtHost"]["value"], True)
                 self.assertEqual(values["owner"]["value"], CONFIG["owner"])
@@ -612,6 +760,34 @@ class GenerationTests(unittest.TestCase):
             ), self.assertRaisesRegex(onboarding.OnboardingError, "compile failed"):
                 onboarding.generate(CONFIG, self.report(), PUBLIC_KEY, output)
             self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_auto_selection_is_pinned_in_config_parameters_and_report_for_every_variant(self):
+        template = (onboarding.ASSETS / "infra" / "main.bicep").read_text(encoding="utf-8")
+        for profile in onboarding.profile_candidates("cpu", "small"):
+            with self.subTest(sku=profile["sku"]), tempfile.TemporaryDirectory() as directory:
+                report = {**self.report(), "profile": profile}
+                output = Path(directory) / "dev"
+                with patch.object(onboarding, "refresh_modules", return_value=(template, {})), patch.object(
+                    onboarding, "command", side_effect=lambda args: Path(args[-1]).write_text("{}")
+                ):
+                    onboarding.generate({**CONFIG, "vmSize": "auto"}, report, PUBLIC_KEY, output)
+                self.assertEqual(json.loads((output / "config.json").read_text())["vmSize"], profile["sku"])
+                self.assertEqual(json.loads((output / "main.parameters.json").read_text())["parameters"]["vmSize"]["value"],
+                                 profile["sku"])
+                self.assertEqual(json.loads((output / "preflight.json").read_text())["profile"], profile)
+
+    def test_unpinned_old_config_cannot_reselect_a_sku_during_parameter_recheck(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "main.parameters.json"
+            path.write_text(json.dumps(onboarding.parameters(CONFIG, IMAGE, PUBLIC_KEY)))
+            with patch("sys.argv", ["onboarding.py", "check", "--config", "unused.json", "--parameters", str(path)]), patch.object(
+                onboarding, "read_config", return_value={**CONFIG, "vmSize": "auto"}
+            ), patch.object(onboarding, "read_public_key", return_value=PUBLIC_KEY), patch.object(
+                onboarding, "preflight"
+            ) as preflight, redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(onboarding.main(), 1)
+                self.assertIn("pinned vmSize", error.getvalue())
+                preflight.assert_not_called()
 
     def test_recheck_detects_parameter_drift(self):
         for changed in (None, "size", "owner", "missing-host-encryption", "disabled-host-encryption", "missing-docker"):
@@ -752,7 +928,7 @@ docker() { printf 'docker %s\n' "$*" >&2; [[ "$FAIL_STEP" != client ]]; }
 
 
 class PricingTests(unittest.TestCase):
-    def rows(self, config=None):
+    def rows(self, config=None, profiles=None):
         config = config or CONFIG
         definitions = [
             ("Storage", "Standard SSD Managed Disks", "E70 LRS Disk", "1/Month", 1228.8, "E70 LRS", ""),
@@ -763,7 +939,7 @@ class PricingTests(unittest.TestCase):
         ]
         definitions.extend(
             ("Virtual Machines", "Virtual Machines Linux", profile["sku"], "1 Hour", 1.305 * 2 ** index, profile["sku"], profile["sku"])
-            for index, profile in enumerate(onboarding.PROFILES[config["compute"]].values())
+            for index, profile in enumerate((profiles or reference_profiles(config["compute"])).values())
         )
         return [
             {
@@ -780,7 +956,7 @@ class PricingTests(unittest.TestCase):
     def estimate(self, rows=None, config=None):
         config = config or CONFIG
         with patch.object(onboarding, "retail_prices", return_value=self.rows(config) if rows is None else rows):
-            return onboarding.estimate_costs(config["location"], onboarding.PROFILES[config["compute"]])
+            return onboarding.estimate_costs(config["location"], reference_profiles(config["compute"]))
 
     def test_full_fixed_costs_and_all_sizes_use_decimal_totals_and_730_hours(self):
         report = self.estimate()
@@ -842,29 +1018,61 @@ class PricingTests(unittest.TestCase):
             io.StringIO(json.dumps({"Items": [2], "NextPageLink": None})),
         ]
         with patch.object(onboarding.urllib.request, "urlopen", side_effect=pages) as fetch:
-            self.assertEqual(onboarding.retail_prices("eastus", onboarding.PROFILES["cpu"]), [1, 2])
+            self.assertEqual(onboarding.retail_prices("eastus", reference_profiles("cpu")), [1, 2])
         query = onboarding.urllib.parse.parse_qs(onboarding.urllib.parse.urlsplit(fetch.call_args_list[0].args[0]).query)["$filter"][0]
         self.assertIn("armRegionName eq 'eastus'", query)
         self.assertIn("armRegionName eq 'Global'", query)
         with patch.object(onboarding.urllib.request, "urlopen", return_value=io.StringIO(
             '{"Items": [], "NextPageLink": "http://example.com/next"}'
         )), self.assertRaisesRegex(onboarding.OnboardingError, "pagination"):
-            onboarding.retail_prices("eastus", onboarding.PROFILES["cpu"])
+            onboarding.retail_prices("eastus", reference_profiles("cpu"))
 
     def test_prices_needs_no_subscription_key_or_azure_login(self):
         with patch("sys.argv", ["onboarding.py", "prices", "--compute", "cpu"]), patch.object(
-            onboarding, "retail_prices", return_value=self.rows()
-        ), patch.object(onboarding, "az", side_effect=AssertionError("Azure login is not needed")), patch.object(
+            onboarding, "estimate_costs", return_value={"profiles": {}}
+        ) as estimate, patch.object(onboarding, "az", side_effect=AssertionError("Azure login is not needed")), patch.object(
             onboarding, "read_public_key", side_effect=AssertionError("SSH key is not needed")
         ), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(onboarding.main(), 0)
         report = json.loads(output.getvalue())
-        self.assertEqual(set(report["profiles"]), {"cpu-small", "cpu-medium", "cpu-large", "cpu-xl"})
+        self.assertEqual(report["profiles"], {})
+        profiles = estimate.call_args.args[1]
+        self.assertEqual(len(profiles), 15)
+        self.assertEqual({profile["processor"] for profile in profiles.values()}, {"Intel", "AMD"})
+        self.assertEqual({profile["generation"] for profile in profiles.values()}, {6, 7})
+
+    def test_subscription_prices_use_quota_selected_profiles_and_disclose_unavailable_sizes(self):
+        profiles = onboarding.profile_candidates("cpu", "small")
+        skus = [{**sku_for(CONFIG, profile), "family": f"family{index}"} for index, profile in enumerate(profiles)]
+        usages = [usage("cores"), usage("virtualMachines")]
+        usages.extend(usage(f"family{index}", 0, (index + 1) * 100) for index in range(4))
+        argv = ["onboarding.py", "prices", "--compute", "cpu", "--subscription", CONFIG["subscriptionId"]]
+        with patch("sys.argv", argv), patch.object(
+            onboarding, "compute_inventory", return_value=(skus, usages)
+        ) as inventory, patch.object(onboarding, "estimate_costs", return_value={"profiles": {}}) as estimate, patch.object(
+            onboarding, "read_public_key", side_effect=AssertionError("No key needed")
+        ), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(onboarding.main(), 0)
+        inventory.assert_called_once_with(CONFIG["subscriptionId"], "westus2", "cpu")
+        estimate.assert_called_once_with("westus2", {"cpu-small": profiles[-1]})
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["subscriptionId"], CONFIG["subscriptionId"])
+        self.assertEqual(report["skuSelection"]["cpu-small"]["selectedSku"], "Standard_D16ads_v6")
+        self.assertEqual(report["skuSelection"]["cpu-xl"]["status"], "Unavailable")
+
+    def test_no_quota_eligible_prices_return_failure_without_fabricated_rates(self):
+        with patch("sys.argv", ["onboarding.py", "prices", "--compute", "cpu",
+                               "--subscription", CONFIG["subscriptionId"]]), patch.object(
+            onboarding, "compute_inventory", return_value=([], [])
+        ), patch.object(onboarding, "estimate_costs") as estimate, redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(onboarding.main(), 1)
+        estimate.assert_not_called()
+        self.assertIn("No quota-eligible", error.getvalue())
 
     def test_all_eight_profiles_use_bounded_queries_and_deduplicate_common_meters(self):
         profiles = {
             f"{compute}-{size}": profile for compute in ("cpu", "gpu")
-            for size, profile in onboarding.PROFILES[compute].items()
+            for size, profile in reference_profiles(compute).items()
         }
         pages = [
             io.StringIO(json.dumps({"Items": self.rows({**CONFIG, "compute": compute}), "NextPageLink": None}))
@@ -876,6 +1084,35 @@ class PricingTests(unittest.TestCase):
         self.assertEqual(len(report["profiles"]), 8)
         self.assertEqual(report["sharedMonthlyUsd"], 1498.57)
 
+    def test_all_candidate_pricing_batches_exact_skus_without_azure_login(self):
+        profiles = {
+            f"{compute}-{size}-{profile['sku']}" if compute == "cpu" else f"{compute}-{size}": profile
+            for compute in ("cpu", "gpu") for size in onboarding.PROFILES[compute]
+            for profile in onboarding.profile_candidates(compute, size)
+        }
+        names = list(profiles)
+        pages = [
+            io.StringIO(json.dumps({
+                "Items": self.rows(profiles={name: profiles[name] for name in names[offset:offset + 4]}),
+                "NextPageLink": None,
+            }))
+            for offset in range(0, len(names), 4)
+        ]
+        with patch("sys.argv", ["onboarding.py", "prices"]), patch.object(
+            onboarding.urllib.request, "urlopen", side_effect=pages
+        ) as fetch, patch.object(onboarding, "az", side_effect=AssertionError("Must not use Azure login")), redirect_stdout(
+            io.StringIO()
+        ) as output:
+            self.assertEqual(onboarding.main(), 0)
+        report = json.loads(output.getvalue())
+        self.assertEqual(len(report["profiles"]), 19)
+        self.assertEqual(report["sharedMonthlyUsd"], 1498.57)
+        self.assertEqual(fetch.call_count, 5)
+        self.assertEqual(report["profiles"]["cpu-small-Standard_D16ads_v6"]["processor"], "AMD")
+        for call in fetch.call_args_list:
+            query = onboarding.urllib.parse.parse_qs(onboarding.urllib.parse.urlsplit(call.args[0]).query)["$filter"][0]
+            self.assertLessEqual(query.count("armSkuName eq"), 4)
+
     def test_generate_and_final_check_refresh_pricing_and_pricing_failures_stop_generation(self):
         for action in ("generate", "check"):
             for fail in (False, True):
@@ -883,13 +1120,28 @@ class PricingTests(unittest.TestCase):
                     "sys.argv", ["onboarding.py", action, "--config", "unused.json"]
                 ), patch.object(onboarding, "read_config", return_value=CONFIG), patch.object(
                     onboarding, "read_public_key", return_value=PUBLIC_KEY
-                ), patch.object(onboarding, "preflight", return_value={"imageReference": IMAGE}), patch.object(
+                ), patch.object(onboarding, "preflight", return_value={
+                    "imageReference": IMAGE, "profile": reference_profiles("cpu")["small"],
+                }), patch.object(
                     onboarding, "estimate_costs", side_effect=onboarding.OnboardingError("No verified price") if fail else None,
                     return_value={"fixture": True}
                 ) as estimate, patch.object(onboarding, "generate") as generate, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     self.assertEqual(onboarding.main(), 1 if fail else 0)
-                    estimate.assert_called_once_with(CONFIG["location"], {"small": onboarding.PROFILES["cpu"]["small"]})
+                    estimate.assert_called_once_with(CONFIG["location"], {"small": reference_profiles("cpu")["small"]})
                     self.assertEqual(generate.called, action == "generate" and not fail)
+
+    def test_generation_prices_the_selected_amd_v6_sku_not_the_reference_intel_v7(self):
+        profile = onboarding.profile_candidates("cpu", "small")[-1]
+        with patch("sys.argv", ["onboarding.py", "generate", "--config", "unused.json"]), patch.object(
+            onboarding, "read_config", return_value={**CONFIG, "vmSize": "auto"}
+        ), patch.object(onboarding, "read_public_key", return_value=PUBLIC_KEY), patch.object(
+            onboarding, "preflight", return_value={"profile": profile, "imageReference": IMAGE}
+        ), patch.object(onboarding, "estimate_costs", return_value={}) as estimate, patch.object(
+            onboarding, "generate"
+        ) as generate, redirect_stdout(io.StringIO()):
+            self.assertEqual(onboarding.main(), 0)
+        estimate.assert_called_once_with("westus2", {"small": profile})
+        self.assertEqual(generate.call_args.args[1]["profile"]["sku"], "Standard_D16ads_v6")
 
 
 if __name__ == "__main__":

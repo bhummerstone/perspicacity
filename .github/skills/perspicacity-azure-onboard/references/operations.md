@@ -54,6 +54,18 @@ was added must be regenerated with an owner and reviewed.
 
 The helper checks eligibility and headroom **even for West US 2**. A quota failure is not a capacity
 failure. Check Azure Quotas for both Total Regional vCPUs and the exact VM family returned by Azure.
+CPU sizes consider Intel Ddsv6/Ddsv7 and AMD Dadsv6/Dadsv7 with unchanged vCPU/RAM and local
+NVMe capacities; AMD v6 ends at 96 vCPUs and cannot supply XL. For `vmSize: auto`, the helper
+excludes missing/restricted/incompatible SKUs and insufficient or unknown quota, then ranks by
+effective available vCPUs (minimum of regional/family headroom), family headroom, newer generation,
+and catalog order (Intel before AMD within a generation). Quota uses limit minus current usage.
+The report's `skuSelection` records candidate outcomes, the exact winner and quota evidence.
+This ranks quota, not price, benchmark performance or physical capacity.
+Review the chosen processor/generation, SKU and PAYG costs, and pin `vmSize` in the request.
+Generation persists that exact SKU in the normalized config and parameters. Final rechecks
+validate only the pinned SKU; they do not choose a different winner. If it no longer qualifies,
+rerun selection and repeat configuration/cost review before regenerating in a new directory.
+Old generated configs without a pinned `vmSize` must be regenerated/reviewed.
 Network quotas can expose different counters across subscriptions. The helper checks matching reported
 counters and discloses that missing service/disk limits still need ARM validation. Policies, billing
 restrictions, regional allocation shortages and concurrent deployments can still block a deployment.
@@ -83,9 +95,14 @@ of complete CCC compliance or customer-managed key coverage.
 
 ### PAYG cost review
 
-Before choosing a size, run `onboarding.py prices --compute cpu --location westus2` (substitute the
-chosen family/region). It needs neither Azure login nor SSH keys. Present each profile's VM USD/hour,
+Before choosing a size, run `onboarding.py prices --compute cpu --location westus2 --subscription <UUID>`
+(substitute the confirmed subscription and chosen mode/region). This uses Azure login for read-only
+compute eligibility/quota selection but needs no SSH keys. Present each selected profile's VM USD/hour,
 VM USD/month and whole-environment **base** USD/month, plus the shared-resource breakdown.
+Disclose unavailable sizes from `skuSelection` and their reasons; they have no price and must not
+be offered as deployable. If all sizes are unavailable, the command fails without pricing.
+Omitting `--subscription` prices every catalog variant without login or quota selection, for
+pricing-only comparisons; those rates alone do not identify a deployable SKU.
 `generate` fetches prices again for the selected profile and saves `cost-estimate.json`; `check`
 refreshes prices in its JSON output immediately before final approval. Do not use a saved estimate
 as if it were a fresh final quote.

@@ -46,18 +46,32 @@ Adjust that path if the skill is installed elsewhere; do not copy just `SKILL.md
 
 Skip questions already answered explicitly. A user's choice of a different region must trigger the
 same live eligibility/quota checks as the default; never silently change region, family or size.
+CPU auto-selection within the documented Intel/AMD v6/v7 candidates is allowed before review;
+after the user reviews a specific SKU, pin it and do not silently substitute another candidate.
 Before the first Azure command or subscription/login question, follow **Azure CLI prerequisite and
 installation offer** below. A missing CLI is a recoverable onboarding decision, not a dead end.
 
 1. **Subscription:** confirm the intended tenant/subscription. If needed, guide the user through
    `az login` and display `az account list --output table`; select the UUID, not a display name.
    Never read token caches, request credentials, or change the global active subscription.
-2. **CPU or GPU:** default CPU. Explain that GPU is a different VM family, not an add-on to Ddsv7.
+2. **CPU or GPU:** default CPU. CPU considers Intel Ddsv6/Ddsv7 and AMD Dadsv6/Dadsv7,
+   retaining the chosen T-shirt's vCPU/RAM and documented local NVMe capacity. AMD v6 has no
+   128-vCPU XL, so XL considers only the other three variants. GPU is a different VM family,
+   not an add-on to the CPU VM.
    GPU profiles are RTX PRO 6000 Blackwell v6, including fractional GPUs.
 3. **Region:** offer West US 2 by default, with an override for latency/residency/existing workloads.
    Check live subscription region, service locations, SKU restrictions, and quota in all cases.
-4. **Size and PAYG costs:** run the read-only `prices` command below for the selected CPU/GPU
+4. **Size and PAYG costs:** run the read-only `prices` command below **with the confirmed subscription
+   UUID** for the selected CPU/GPU
    family and region **before** asking the user to select Small/Medium/Large/XL. Recommend Small.
+   For each CPU size, the helper selects among eligible Intel/AMD v6/v7 variants by highest
+   effective available vCPUs (minimum of regional and family headroom), then family headroom,
+   then newer generation, then catalog order (Intel before AMD within a generation).
+   Eligibility includes live SKU restrictions, x64/Gen2, matching vCPU/RAM, NVMe, Trusted Launch
+   and host encryption. Missing quota is not unlimited. Display unavailable sizes and their
+   reasons, not a zero price; if none qualify, stop and discuss quota/region options.
+   Show the selected processor/generation, exact SKU and quota evidence. Hardware capacities
+   are equivalent within a T-shirt, but generations/vendors can differ in performance and price.
    Show vCPU, RAM, **per-device and total** CPU NVMe, or documented total GPU NVMe, and GPU VRAM.
    XL GPU VRAM is spread across two GPUs, not transparently pooled. Do not invent GPU disk counts.
    Present a table with size, exact SKU, hardware, VM-only USD/hour, and **whole-environment
@@ -86,7 +100,8 @@ installation offer** below. A missing CLI is a recoverable onboarding decision, 
    E70 provisions **16 TiB even on Small**.
    Bastion Standard, NAT, public IPs,
    and managed disks continue billing when the VM is stopped/deallocated. GPU allocation is costly.
-   Confirm the configuration before generating. File-generation approval is not deployment approval.
+   Confirm the configuration before generating and set `vmSize` in the request to the exact
+   reviewed SKU. File-generation approval is not deployment approval.
 
 ## Azure CLI prerequisite and installation offer
 
@@ -129,6 +144,12 @@ names, owner/team, username and public-key path with the user's choices. Owner i
 must add it. Omitted optional fields take the defaults.
 Relative public-key paths are relative to the JSON config file; `~` expands to the user's home.
 Unknown fields are rejected to catch spelling mistakes.
+`vmSize` defaults to `auto`: preflight ranks same-size eligible candidates using live quota.
+For the interactive flow, replace `auto` with the exact SKU reviewed in the size/cost step.
+Generation saves the resolved SKU in `config.json` and parameters. Final `check` revalidates
+that pinned SKU even if another variant now has more quota; it never reselects. Older output
+without a pinned `vmSize` must be regenerated/reviewed. If a pinned SKU becomes unavailable,
+stop, rerun subscription-aware pricing, and obtain a new configuration/cost review before regenerating.
 
 ```powershell
 python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py generate --config .azure-vm\request.json --output .azure-vm\dev
@@ -138,6 +159,8 @@ This command does **not** deploy or create SSH keys. It:
 
 - Checks provider registrations/service regions, exact SKU eligibility, regional and family vCPU
   quotas, VM count, and relevant network quotas returned by Azure, including two public IPs.
+  For auto CPU selection, records all candidate outcomes and the quota ranking in
+  `preflight.json` as `skuSelection`; pricing and parameters use the selected exact SKU.
 - Checks the caller's reported deployment actions at the existing empty resource group, or at
   subscription scope when creating a new group. Accounts for wildcard grants and `notActions`.
   Missing permissions block generation/recheck. Never grant roles, request Owner, or activate PIM
@@ -163,7 +186,8 @@ This command does **not** deploy or create SSH keys. It:
   It refuses to overwrite an output directory and publishes output only after compilation succeeds.
 
 Surface any error and resolve it with the user. For zero/insufficient GPU quota, explain Azure Quotas
-requests. Do not auto-request quota, choose a smaller profile, downgrade the image/family, or claim
+requests. Do not auto-request quota, choose a smaller profile, use a family outside the documented
+same-size CPU candidates, downgrade the image/security requirements, or claim
 that sufficient quota guarantees physical capacity. A provider's advertised region list does not
 guarantee every SKU/API combination; ARM validation and allocation remain necessary.
 
@@ -171,14 +195,20 @@ Read and explain warnings, including any limits not exposed by the API.
 Review policy/permissions with ARM validation; the helper is not an exhaustive policy audit.
 When proposing a different region or size, regenerate and repeat review.
 
-## Price the T-shirt options (no Azure login required)
+## Price and select the T-shirt options
 
 ```powershell
-python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py prices --compute cpu --location westus2
+python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py prices --compute cpu --location westus2 --subscription <confirmed-subscription-UUID>
 ```
 
-Use `--compute gpu` for GPU or omit `--compute` for all eight profiles. This contacts the public
-Azure Retail Prices API and sends only public region/SKU filters, not subscription/key/owner details.
+Use `--compute gpu` for GPU or omit `--compute` for both compute modes. With `--subscription`,
+the helper reads SKU eligibility and quota, then prices one selected candidate for each eligible size.
+Unavailable sizes are disclosed in `skuSelection`, omitted from priced `profiles`, and must not
+be offered as deployable. All sizes unavailable is an error. This checks compute eligibility/quota,
+not provider/feature registration or full deployment permissions; generation still performs full preflight.
+Without `--subscription`, `prices` needs no login and prices all 15 CPU candidates plus four GPU
+profiles (or the requested mode), without choosing a winner or claiming quota eligibility.
+The public Azure Retail Prices API receives only public region/SKU filters, not subscription/key/owner details.
 It retrieves current USD Linux PAYG rates, both disks, Bastion Standard's two included scale units,
 NAT's Global public-cloud meter and two Standard static IPv4 addresses. It does not check capacity.
 Show `profiles[*].baseMonthlyUsd`, not just VM-only cost. NAT processing, bandwidth/Bastion transfer

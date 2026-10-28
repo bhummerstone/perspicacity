@@ -29,6 +29,7 @@ DEFAULTS = {
     "location": PROFILES["defaultLocation"],
     "compute": "cpu",
     "size": PROFILES["defaultSize"],
+    "vmSize": "auto",
     "vnetCidr": "192.168.0.0/24",
     "bastionSubnetCidr": "192.168.0.0/26",
     "vmSubnetCidr": "192.168.0.64/26",
@@ -166,6 +167,8 @@ def read_config(path):
         raise OnboardingError("Use a region code such as westus2, not a display name.")
     if config["compute"] not in ("cpu", "gpu") or config["size"] not in ("small", "medium", "large", "xl"):
         raise OnboardingError("compute must be cpu/gpu; size must be small/medium/large/xl.")
+    if config["vmSize"] != "auto":
+        pinned_profile(config)
     key = Path(config["sshPublicKeyPath"]).expanduser()
     config["sshPublicKeyPath"] = str((path.parent / key).resolve() if not key.is_absolute() else key.resolve())
     validate_networks(config)
@@ -196,8 +199,30 @@ def capabilities(sku):
     return {entry["name"].lower(): entry["value"] for entry in sku.get("capabilities", [])}
 
 
-def select_sku(skus, config):
-    profile = PROFILES[config["compute"]][config["size"]]
+def profile_candidates(compute, size):
+    profile = PROFILES[compute][size]
+    if compute == "gpu":
+        return [dict(profile)]
+    return [
+        {
+            **profile, "sku": f"Standard_D{profile['vcpus']}{variant['suffix']}",
+            "processor": variant["processor"], "generation": variant["generation"],
+        }
+        for variant in PROFILES["cpuVariants"] if profile["vcpus"] <= variant["maxVcpus"]
+    ]
+
+
+def pinned_profile(config):
+    profile = next(
+        (profile for profile in profile_candidates(config["compute"], config["size"])
+         if profile["sku"] == config["vmSize"]), None,
+    )
+    if profile is None:
+        raise OnboardingError("vmSize must be auto or an exact catalog SKU for the chosen compute/T-shirt size; parameters require a pinned SKU.")
+    return profile
+
+
+def select_sku(skus, config, profile):
     matches = [sku for sku in skus if sku["name"] == profile["sku"]]
     if len(matches) != 1:
         raise OnboardingError(f"{profile['sku']} is not offered in {config['location']}. Choose another region.")
@@ -215,6 +240,8 @@ def select_sku(skus, config):
         raise OnboardingError("The selected SKU does not advertise the required x64 architecture.")
     if int(caps.get("vcpus", 0)) != profile["vcpus"]:
         raise OnboardingError("Live vCPU count differs from the sizing catalog; review the profile before deploying.")
+    if Decimal(caps.get("memorygb", "0")) != profile["memoryGiB"]:
+        raise OnboardingError("Live memory size differs from the sizing catalog; review the profile before deploying.")
     if caps.get("encryptionathostsupported", "").lower() != "true":
         raise OnboardingError(
             f"{sku['name']} does not advertise EncryptionAtHostSupported=True in {config['location']}. "
@@ -246,6 +273,52 @@ def check_quota(usages, requirements):
             )
         checks.append({"name": name, "used": used, "limit": limit, "required": needed})
     return checks
+
+
+def select_compute(config, skus, usages):
+    """Rank eligible same-size variants by quota; never replace an explicitly pinned SKU."""
+    candidates = profile_candidates(config["compute"], config["size"])
+    if config["vmSize"] != "auto":
+        candidates = [pinned_profile(config)]
+    eligible, evidence = [], []
+    for index, profile in enumerate(candidates):
+        entry = {"sku": profile["sku"]}
+        evidence.append(entry)
+        try:
+            sku = select_sku(skus, config, profile)
+            checks = check_quota(usages, {
+                "cores": profile["vcpus"], sku["family"]: profile["vcpus"], "virtualMachines": 1,
+            })
+        except OnboardingError as exc:
+            entry.update(status="Unavailable", reason=str(exc))
+            continue
+        regional, family = (check["limit"] - check["used"] for check in checks[:2])
+        entry.update(
+            status="Eligible", family=sku["family"], regionalAvailableVcpus=regional,
+            familyAvailableVcpus=family, effectiveAvailableVcpus=min(regional, family),
+        )
+        rank = (min(regional, family), family, profile.get("generation", 0), -index)
+        eligible.append((rank, profile, checks))
+    if not eligible:
+        reasons = "\n".join(f"{entry['sku']}: {entry['reason']}" for entry in evidence)
+        raise OnboardingError(
+            f"No eligible {config['compute']} {config['size']} SKU in {config['location']} with sufficient quota:\n{reasons}"
+        )
+    _, profile, checks = max(eligible, key=lambda candidate: candidate[0])
+    return profile, checks, {
+        "mode": "QuotaRanked" if config["vmSize"] == "auto" else "Pinned",
+        "selectedSku": profile["sku"],
+        "ranking": "Effective available vCPUs, then family available vCPUs, then newer generation, then catalog order (Intel before AMD within a generation).",
+        "candidates": evidence,
+    }
+
+
+def compute_inventory(subscription, location, compute):
+    return (
+        az("vm", "list-skus", "--location", location, "--resource-type", "virtualMachines",
+           "--size", "Standard_D" if compute == "cpu" else "Standard_NC", "--all", subscription=subscription),
+        az("vm", "list-usage", "--location", location, subscription=subscription),
+    )
 
 
 def latest_offer(offers, compute):
@@ -351,7 +424,7 @@ def check_permissions(config, group_exists):
 def retail_prices(location, profiles):
     if not re.fullmatch(r"[a-z][a-z0-9]+", location):
         raise OnboardingError("Use a region code such as westus2.")
-    # The service rejects long OData URLs; batch the eight profiles into family-sized queries.
+    # The service rejects long OData URLs; batch at most four exact SKUs per query.
     if len(profiles) > 4:
         names = list(profiles)
         return [
@@ -513,12 +586,8 @@ def preflight(config, pinned_image=None):
         if resources:
             raise OnboardingError("Use a new or empty resource group. This flow does not adopt or resize existing resources.")
     permission_report = check_permissions(config, group_exists)
-    profile = PROFILES[config["compute"]][config["size"]]
-    skus = az("vm", "list-skus", "--location", location, "--resource-type", "virtualMachines",
-              "--size", profile["sku"], "--all", subscription=subscription)
-    sku = select_sku(skus, config)
-    usages = az("vm", "list-usage", "--location", location, subscription=subscription)
-    quotas = check_quota(usages, {"cores": profile["vcpus"], sku["family"]: profile["vcpus"], "virtualMachines": 1})
+    skus, usages = compute_inventory(subscription, location, config["compute"])
+    profile, quotas, selection = select_compute(config, skus, usages)
     network_usages = az("network", "list-usages", "--location", location, subscription=subscription)
     network_needs = {
         "virtualnetworks": 1, "networksecuritygroups": 1, "networkinterfaces": 1,
@@ -542,6 +611,7 @@ def preflight(config, pinned_image=None):
         "owner": config["owner"],
         "permissionCheck": permission_report,
         "profile": profile,
+        "skuSelection": selection,
         "imageReference": image,
         "hostEncryption": {
             "enabled": True,
@@ -582,7 +652,7 @@ def parameters(config, image, public_key):
     values = {
         "location": config["location"], "namePrefix": config["namePrefix"],
         "adminUsername": config["adminUsername"], "sshPublicKey": public_key,
-        "vmSize": PROFILES[config["compute"]][config["size"]]["sku"],
+        "vmSize": pinned_profile(config)["sku"],
         "computeMode": config["compute"], "imageReference": image,
         "encryptionAtHost": True,
         "owner": config["owner"],
@@ -620,6 +690,7 @@ def write_json(path, data):
 def generate(config, report, public_key, output):
     if output.exists():
         raise OnboardingError(f"Refusing to overwrite {output}. Choose a new output directory.")
+    config = {**config, "vmSize": report["profile"]["sku"]}
     template, versions = refresh_modules((ASSETS / "infra" / "main.bicep").read_text(encoding="utf-8"))
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="onboarding-", dir=output.parent) as temporary:
@@ -645,8 +716,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("generate", "check", "prices", "prerequisites"))
     parser.add_argument("--config", type=Path)
-    parser.add_argument("--location", default=PROFILES["defaultLocation"], help="Region for prices (no Azure login required).")
+    parser.add_argument("--location", default=PROFILES["defaultLocation"], help="Region for prices.")
     parser.add_argument("--compute", choices=("cpu", "gpu", "all"), default="all", help="Profile family for prices.")
+    parser.add_argument("--subscription", help="For prices: select quota-eligible SKUs using this subscription UUID.")
     parser.add_argument("--output", type=Path, default=Path(".azure-vm") / "dev")
     parser.add_argument("--parameters", type=Path, help="Recheck an existing generated parameter file without upgrading its image.")
     args = parser.parse_args()
@@ -660,15 +732,41 @@ def main():
         if args.action == "prices":
             if args.config or args.parameters:
                 raise OnboardingError("prices uses --location/--compute, not --config/--parameters.")
-            profiles = {
-                f"{compute}-{size}": profile
-                for compute in ("cpu", "gpu") if args.compute in ("all", compute)
-                for size, profile in PROFILES[compute].items()
-            }
-            print(json.dumps(estimate_costs(args.location, profiles), indent=2))
+            profiles, selections = {}, {}
+            if args.subscription:
+                args.subscription = str(uuid.UUID(args.subscription))
+                if not re.fullmatch(r"[a-z][a-z0-9]+", args.location):
+                    raise OnboardingError("Use a region code such as westus2.")
+            for compute in ("cpu", "gpu"):
+                if args.compute not in ("all", compute):
+                    continue
+                if args.subscription:
+                    skus, usages = compute_inventory(args.subscription, args.location, compute)
+                for size in PROFILES[compute]:
+                    name = f"{compute}-{size}"
+                    if args.subscription:
+                        config = {**DEFAULTS, "compute": compute, "size": size, "location": args.location}
+                        try:
+                            profile, _, selection = select_compute(config, skus, usages)
+                        except OnboardingError as exc:
+                            selections[name] = {"status": "Unavailable", "reason": str(exc)}
+                            continue
+                        profiles[name] = profile
+                        selections[name] = {"status": "Eligible", **selection}
+                    else:
+                        for profile in profile_candidates(compute, size):
+                            profiles[f"{name}-{profile['sku']}" if compute == "cpu" else name] = profile
+            if not profiles:
+                raise OnboardingError("No quota-eligible T-shirt options:\n" + json.dumps(selections, indent=2))
+            report = estimate_costs(args.location, profiles)
+            if args.subscription:
+                report.update(subscriptionId=args.subscription, skuSelection=selections)
+            print(json.dumps(report, indent=2))
             return 0
         if not args.config:
             raise OnboardingError("--config is required for generate/check.")
+        if args.subscription:
+            raise OnboardingError("generate/check use the subscriptionId in --config, not --subscription.")
         config = read_config(args.config.resolve())
         public_key = read_public_key(config["sshPublicKeyPath"])
         pinned = None
@@ -680,11 +778,14 @@ def main():
             pinned = existing["parameters"]["imageReference"]["value"]
             if pinned["version"] == "latest":
                 raise OnboardingError("Generated parameters must pin an exact Ubuntu image version.")
+            if config["vmSize"] == "auto":
+                raise OnboardingError("Rechecking generated parameters requires a pinned vmSize in config.json. Regenerate and review older output.")
         report = preflight(config, pinned)
-        if existing is not None and existing != parameters(config, report["imageReference"], public_key):
+        resolved_config = {**config, "vmSize": report["profile"]["sku"]}
+        if existing is not None and existing != parameters(resolved_config, report["imageReference"], public_key):
             raise OnboardingError("Parameters differ from the approved config/key/profile. Regenerate in a new directory.")
         report["costEstimate"] = estimate_costs(config["location"], {
-            config["size"]: PROFILES[config["compute"]][config["size"]],
+            config["size"]: report["profile"],
         })
         if args.action == "generate":
             generate(config, report, public_key, args.output.resolve())
