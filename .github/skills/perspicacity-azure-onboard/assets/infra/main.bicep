@@ -29,6 +29,16 @@ param vmSize string
 ])
 param computeMode string = 'cpu'
 
+@description('Recommended private access through Bastion plus NAT, or a direct public IP for demos only.')
+@allowed([
+  'bastion'
+  'public-ip'
+])
+param accessMode string = 'bastion'
+
+@description('Required in public-ip mode: approved administrator IPv4 CIDR for inbound SSH, never 0.0.0.0/0.')
+param sshSourceCidr string = ''
+
 @description('Host encryption with Azure platform-managed keys is required for every profile.')
 @allowed([
   true
@@ -44,7 +54,7 @@ param vnetCidr string = '192.168.0.0/24'
 @description('Dedicated AzureBastionSubnet, /26 or larger.')
 param bastionSubnetCidr string = '192.168.0.0/26'
 
-@description('Private VM subnet, with explicit outbound connectivity through NAT.')
+@description('VM subnet, with explicit outbound connectivity through NAT or the VM public IP.')
 param vmSubnetCidr string = '192.168.0.64/26'
 
 @description('Required first-boot cloud-init installs Docker for all profiles and the supported host driver for GPU. Never include secrets.')
@@ -57,11 +67,12 @@ param tags object = {
 }
 
 var resourceTags = union(tags, { owner: owner })
+var privateAccess = accessMode == 'bastion'
 
 module outboundIp 'br/public:avm/res/network/public-ip-address:0.13.0' = {
   name: 'outbound-ip'
   params: {
-    name: '${namePrefix}-nat-pip'
+    name: privateAccess ? '${namePrefix}-nat-pip' : '${namePrefix}-vm-pip'
     location: location
     skuName: 'Standard'
     publicIPAllocationMethod: 'Static'
@@ -71,7 +82,7 @@ module outboundIp 'br/public:avm/res/network/public-ip-address:0.13.0' = {
   }
 }
 
-module bastionIp 'br/public:avm/res/network/public-ip-address:0.13.0' = {
+module bastionIp 'br/public:avm/res/network/public-ip-address:0.13.0' = if (privateAccess) {
   name: 'bastion-ip'
   params: {
     name: '${namePrefix}-bastion-pip'
@@ -84,7 +95,7 @@ module bastionIp 'br/public:avm/res/network/public-ip-address:0.13.0' = {
   }
 }
 
-module nat 'br/public:avm/res/network/nat-gateway:2.1.1' = {
+module nat 'br/public:avm/res/network/nat-gateway:2.1.1' = if (privateAccess) {
   name: 'nat'
   params: {
     name: '${namePrefix}-nat'
@@ -106,13 +117,13 @@ module vmNsg 'br/public:avm/res/network/network-security-group:0.5.4' = {
     location: location
     securityRules: [
       {
-        name: 'AllowSshFromBastion'
+        name: privateAccess ? 'AllowSshFromBastion' : 'AllowSshFromApprovedSource'
         properties: {
           priority: 100
           access: 'Allow'
           direction: 'Inbound'
           protocol: 'Tcp'
-          sourceAddressPrefix: bastionSubnetCidr
+          sourceAddressPrefix: privateAccess ? bastionSubnetCidr : sshSourceCidr
           sourcePortRange: '*'
           destinationAddressPrefix: vmSubnetCidr
           destinationPortRange: '22'
@@ -145,31 +156,32 @@ module vnet 'br/public:avm/res/network/virtual-network:0.10.2' = {
     addressPrefixes: [
       vnetCidr
     ]
-    subnets: [
+    subnets: concat(privateAccess ? [
       {
         name: 'AzureBastionSubnet'
         addressPrefix: bastionSubnetCidr
       }
+    ] : [], [
       {
         name: 'vm'
         addressPrefix: vmSubnetCidr
         defaultOutboundAccess: false
-        natGatewayResourceId: nat.outputs.resourceId
+        natGatewayResourceId: privateAccess ? nat!.outputs.resourceId : null
         networkSecurityGroupResourceId: vmNsg.outputs.resourceId
       }
-    ]
+    ])
     tags: resourceTags
     enableTelemetry: false
   }
 }
 
-module bastion 'br/public:avm/res/network/bastion-host:0.8.2' = {
+module bastion 'br/public:avm/res/network/bastion-host:0.8.2' = if (privateAccess) {
   name: 'bastion'
   params: {
     name: '${namePrefix}-bastion'
     location: location
     virtualNetworkResourceId: vnet.outputs.resourceId
-    bastionSubnetPublicIpResourceId: bastionIp.outputs.resourceId
+    bastionSubnetPublicIpResourceId: bastionIp!.outputs.resourceId
     skuName: 'Standard'
     scaleUnits: 2
     enableFileCopy: false
@@ -236,6 +248,9 @@ module vm 'br/public:avm/res/compute/virtual-machine:0.22.3' = {
             name: 'ipconfig'
             subnetResourceId: '${vnet.outputs.resourceId}/subnets/vm'
             privateIPAllocationMethod: 'Dynamic'
+            pipConfiguration: privateAccess ? null : {
+              publicIPAddressResourceId: outboundIp.outputs.resourceId
+            }
           }
         ]
       }
@@ -248,14 +263,20 @@ module vm 'br/public:avm/res/compute/virtual-machine:0.22.3' = {
   }
 }
 
-@description('Private VM resource ID for the Bastion tunnel target.')
+@description('VM resource ID, also used as the Bastion tunnel target in private mode.')
 output vmResourceId string = vm.outputs.resourceId
 
-@description('Bastion name. The AVM Standard SKU enables native-client tunneling.')
-output bastionName string = bastion.outputs.name
+@description('Selected access architecture.')
+output deployedAccessMode string = accessMode
 
-@description('Static public IP used for outbound connections, not inbound SSH.')
+@description('Bastion name in private mode; empty for direct public-IP demos.')
+output bastionName string = privateAccess ? bastion!.outputs.name : ''
+
+@description('Static egress IP: NAT in private mode, NIC-attached VM IP in demo mode.')
 output outboundPublicIp string = outboundIp.outputs.ipAddress
+
+@description('Direct SSH address for public-IP demos; empty in private mode.')
+output vmPublicIp string = privateAccess ? '' : outboundIp.outputs.ipAddress
 
 @description('Managed durable data disk, detached rather than deleted when only the VM is deleted.')
 output durableDiskName string = '${namePrefix}-durable-e70'

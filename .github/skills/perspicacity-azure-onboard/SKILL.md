@@ -1,6 +1,6 @@
 ---
 name: perspicacity-azure-onboard
-description: Guide a user through a private Ubuntu development VM on Azure using Bicep and the latest Azure Verified Modules. Use for onboarding, CPU/GPU T-shirt sizing, local NVMe, a 16 TiB E70 durable disk, Bastion SSH/VS Code, NAT static egress, SSH keys, subscription/region/quota checks, and consent-gated disk preparation after VM creation. Generates reviewed configuration before any explicitly approved deployment.
+description: Guide a user through an Ubuntu development VM on Azure using Bicep and the latest Azure Verified Modules. Use for onboarding, CPU/GPU T-shirt sizing, local NVMe, a 16 TiB E70 durable disk, recommended private Bastion plus NAT access or a direct Standard public IP for demos, SSH/VS Code, SSH keys, subscription/region/quota checks, and consent-gated disk preparation after VM creation. Generates reviewed configuration before any explicitly approved deployment.
 ---
 
 # Perspicacity Azure onboarding
@@ -17,16 +17,26 @@ Read `assets/profiles.json` for exact CPU/GPU mappings and `references/operation
 The repository examples below assume the skill is installed at `.github\skills\perspicacity-azure-onboard`.
 Adjust that path if the skill is installed elsewhere; do not copy just `SKILL.md`.
 
-## Fixed architecture
+## Architecture and access options
 
 - West US 2 (`westus2`) is the default for **both** CPU and GPU, not a promise of capacity.
-- One VNet, default `192.168.0.0/24`; `AzureBastionSubnet` = `192.168.0.0/26`;
-  VM subnet = `192.168.0.64/26`. These are private CIDRs, not a requirement to use classful networking.
-- Bastion **Standard**, with native-client tunneling, for local SSH and VS Code Remote SSH.
-  Developer is browser-only and is not a cheaper drop-in replacement for this experience.
-- No public IP on the VM. A Standard NAT gateway is attached to the **VM subnet**, with one
-  static Standard public IP for outbound traffic. Bastion has its own separate public IP.
-- SSH port 22 is allowed only from the Bastion subnet. Other inbound traffic is denied.
+- All infrastructure is deployed through Azure Verified Modules (AVM), including public IPs,
+  NAT, Bastion, VNet, NSG and the VM with its NIC/disks.
+- One VNet, default `192.168.0.0/24`; VM subnet = `192.168.0.64/26`.
+  These are private CIDRs, not a requirement to use classful networking.
+- **Recommended/default (`accessMode: "bastion"`):** Bastion **Standard** plus a Standard NAT gateway
+  are one bundled option. Bastion enables native-client SSH and VS Code Remote SSH; Developer is
+  browser-only and not a cheaper drop-in replacement. `AzureBastionSubnet` = `192.168.0.0/26`.
+  No public IP is attached to the VM. NAT on the **VM subnet** has one static Standard public IP for
+  outbound traffic; Bastion has a separate public IP. SSH port 22 is allowed only from its subnet.
+- **Demo only (`accessMode: "public-ip"`):** one static Standard IPv4 public IP attached directly
+  to the VM NIC provides inbound SSH and explicit outbound connectivity. No NAT, Bastion or
+  Bastion subnet is deployed. Require an explicit administrator IPv4 source CIDR (`sshSourceCidr`,
+  preferably the user's public egress IPv4 `/32`); allow SSH only from it, never `0.0.0.0/0`.
+  Explain the public exposure and obtain an explicit choice; do not silently select this mode to
+  bypass costs, quotas or service availability. Do not discover the user's address externally without consent.
+- In both modes other inbound traffic is denied and default subnet outbound access is disabled.
+  Demo mode does not automatically open application ports or the Docker API.
 - Local NVMe comes with the VM SKU, is temporary, and can be erased by deallocation, redeployment
   or host events. It is not the OS disk or durable storage. Multiple devices are not automatically pooled.
 - A 128 GiB Premium SSD OS disk and one **16,384 GiB Standard SSD LRS data disk (E70)** at LUN 0.
@@ -65,9 +75,15 @@ installation offer** below. A missing CLI is a recoverable onboarding decision, 
    GPU profiles are RTX PRO 6000 Blackwell v6, including fractional GPUs.
 3. **Region:** offer West US 2 by default, with an override for latency/residency/existing workloads.
    Check live subscription region, service locations, SKU restrictions, and quota in all cases.
-4. **Size and PAYG costs:** run the read-only `prices` command below **with the confirmed subscription
+4. **Access architecture:** offer "Bastion Standard + NAT Gateway (Recommended)" and
+   "Direct Standard public IP (Demo only)" as mutually exclusive choices. Default to `bastion`.
+   Explain private access versus direct public exposure and the different fixed charges before choosing.
+   For `public-ip`, separately ask for the approved administrator IPv4 source CIDR (`/32` recommended);
+   never default to internet-wide SSH. Record `accessMode` and, for demos, `sshSourceCidr`.
+5. **Size and PAYG costs:** run the read-only `prices` command below **with the confirmed subscription
    UUID** for the selected CPU/GPU
-   family and region **before** asking the user to select Small/Medium/Large/XL. Recommend Small.
+   family, region and `--access-mode <chosen-mode>` **before** asking the user to select
+   Small/Medium/Large/XL. Recommend Small.
    For each CPU size, the helper selects among eligible Intel/AMD v6/v7 variants by highest
    effective available vCPUs (minimum of regional and family headroom), then family headroom,
    then newer generation, then catalog order (Intel before AMD within a generation).
@@ -79,36 +95,37 @@ installation offer** below. A missing CLI is a recoverable onboarding decision, 
    Show vCPU, RAM, **per-device and total** CPU NVMe, or documented total GPU NVMe, and GPU VRAM.
    XL GPU VRAM is spread across two GPUs, not transparently pooled. Do not invent GPU disk counts.
    Present a table with size, exact SKU, hardware, VM-only USD/hour, and **whole-environment
-   base USD/month**, assuming 730 VM hours/month. Show the common disk/Bastion/NAT/IP breakdown,
+   base USD/month**, assuming 730 VM hours/month. Show the selected mode's disk/network/IP breakdown,
    pricing timestamp/source and excluded usage charges. These are PAYG estimates, not quotes.
    Do not substitute Spot/reserved/Windows rates or extrapolate a missing size from another SKU.
-   Stop on missing/ambiguous prices; do not present zero as an estimate. Reprice if the region changes.
-5. **Names, owner and access:** ask individually for a new resource group, short workload prefix,
+   Stop on missing/ambiguous prices; do not present zero as an estimate. Reprice if region or access mode changes.
+6. **Names and owner:** ask individually for a new resource group, short workload prefix,
    Linux administrator username, and accountable owner/team label (`owner`; prefer a team identifier).
    Owner is a resource tag, not a role assignment or request for personal contact details.
-   Explain that the helper refuses nonempty resource groups. Present Bastion Standard SSH/VS Code
-   as the secure default and confirm it is acceptable during configuration review; do not offer public SSH.
-6. **SSH key:** ask "Use an existing SSH key or create a new key locally?" Ask only for the **public**
+   Explain that the helper refuses nonempty resource groups.
+7. **SSH key:** ask "Use an existing SSH key or create a new key locally?" Ask only for the **public**
    key file path. For a new key, use a unique path under the user's `.ssh` directory, outside the repo.
    Let the user run `ssh-keygen -t ed25519 -a 100 -f <unique-path>` in their own interactive terminal
    and choose a passphrase there. Do not supply an empty passphrase, capture it in tools/chat,
    overwrite keys, read a private key, or put one in parameters, logs, artifacts or Git.
    Existing RSA keys must be at least 2048 bits (4096 recommended). The matching private key will
    be needed locally for connection, but its contents must never be requested.
-7. **IP addressing:** use the defaults unless the user requests different CIDRs; do not ask about
-   home/LAN/VPN or other VNet overlap. This is an isolated development VNet accessed through
-   Bastion, with no VPN or peering. If changing the VNet, also recalculate both subnets.
-   The helper checks private IPv4 alignment, subnet containment and non-overlap between the two subnets.
-8. **Review:** show subscription, owner, selected SKU, image policy, region, CIDRs, access method,
+8. **IP addressing:** use the defaults unless the user requests different CIDRs; do not ask about
+   home/LAN/VPN or other VNet overlap. This is an isolated development VNet with no VPN or peering.
+   If changing the VNet, also recalculate the deployed subnet(s). The helper checks private IPv4
+   alignment, subnet containment and, in Bastion mode, non-overlap between the two subnets.
+   `bastionSubnetCidr` is unused in demo mode.
+9. **Review:** show subscription, owner, selected SKU, image policy, region, CIDRs, access method,
+   demo SSH source restriction when applicable,
    keys (public-key path only), disks, first-boot Docker/GPU software and ongoing costs.
    Include the proposed post-creation disk layout, GPT/ext4, administrator ownership and UUID-based
    persistent mounts. Explain that exact devices and formatting require a separate review after creation.
    E70 provisions **16 TiB even on Small**.
-   Bastion Standard, NAT, public IPs,
-   and managed disks continue billing when the VM is stopped/deallocated. GPU allocation is costly.
+   Deployed Bastion Standard/NAT, static public IPs and managed disks continue billing when the VM
+   is stopped/deallocated. Demo mode has one billed public IP and no Bastion/NAT charges. GPU allocation is costly.
    Confirm the configuration before generating and set `vmSize` in the request to the exact
    reviewed SKU. File-generation approval is not deployment approval.
-9. **Post-creation disks:** after deployment, cloud-init and software readiness checks, perform
+10. **Post-creation disks:** after deployment, cloud-init and software readiness checks, perform
    the disk preparation workflow in `references/operations.md`. Inspect the newly created VM,
    show an exact-device plan and ask explicit permission before partitioning/formatting, mounting,
    setting ownership or editing `/etc/fstab`. Deployment approval alone is not formatting approval.
@@ -153,6 +170,11 @@ Do not install software, sign in, register providers, or create resources withou
 Create `.azure-vm\request.json` using `assets/config.example.json`, replacing the subscription UUID,
 names, owner/team, username and public-key path with the user's choices. Owner is required; old requests
 must add it. Omitted optional fields take the defaults.
+`accessMode` defaults to `bastion` (Bastion plus NAT). For demos set `"accessMode": "public-ip"`
+and add `"sshSourceCidr": "<approved-public-IPv4>/32"`. This field is required for public-IP mode
+and must be omitted/empty in Bastion mode; internet-wide IPv4 and all IPv6 sources are rejected.
+Previously generated parameters without the explicit access fields must be regenerated/reviewed
+in a new output directory; do not patch or redeploy an existing environment to change its access mode.
 Relative public-key paths are relative to the JSON config file; `~` expands to the user's home.
 Unknown fields are rejected to catch spelling mistakes.
 `vmSize` defaults to `auto`: preflight ranks same-size eligible candidates using live quota.
@@ -169,7 +191,9 @@ python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py generate 
 This command does **not** deploy or create SSH keys. It:
 
 - Checks provider registrations/service regions, exact SKU eligibility, regional and family vCPU
-  quotas, VM count, and relevant network quotas returned by Azure, including two public IPs.
+  quotas, VM count, and relevant network quotas returned by Azure for the selected mode:
+  two public IPs plus NAT/Bastion for private access, or one public IP and no NAT/Bastion for demos.
+  Provider/service-region and permission checks likewise require only deployed services.
   For auto CPU selection, records all candidate outcomes and the quota ranking in
   `preflight.json` as `skuSelection`; pricing and parameters use the selected exact SKU.
 - Checks the caller's reported deployment actions at the existing empty resource group, or at
@@ -220,10 +244,13 @@ not provider/feature registration or full deployment permissions; generation sti
 Without `--subscription`, `prices` needs no login and prices all 15 CPU candidates plus four GPU
 profiles (or the requested mode), without choosing a winner or claiming quota eligibility.
 The public Azure Retail Prices API receives only public region/SKU filters, not subscription/key/owner details.
-It retrieves current USD Linux PAYG rates, both disks, Bastion Standard's two included scale units,
-NAT's Global public-cloud meter and two Standard static IPv4 addresses. It does not check capacity.
-Show `profiles[*].baseMonthlyUsd`, not just VM-only cost. NAT processing, bandwidth/Bastion transfer
-and disk transactions are excluded usage charges, **not zero-cost services**. Taxes, negotiated
+Pass `--access-mode bastion` (default) or `--access-mode public-ip` to match the chosen architecture.
+It retrieves current USD Linux PAYG rates and both disks. Private mode adds Bastion Standard's two
+included scale units, NAT's Global public-cloud meter and two Standard static IPv4 addresses.
+Demo mode prices one Standard static IPv4 address and does not request or require NAT/Bastion rates.
+It does not check capacity. Show `profiles[*].baseMonthlyUsd`, not just VM-only cost.
+Bandwidth and disk transactions, plus NAT processing/Bastion transfer when deployed, are excluded
+usage charges, **not zero-cost services**. Taxes, negotiated
 discounts, reservations and credits are not assumed. Never imply deallocation stops the fixed charges.
 
 ## Deployment gate and handoff
@@ -246,7 +273,7 @@ estimated costs** confirmation, then deploy. A price/configuration change invali
 approval. Failed pricing is a blocker, not permission to skip the estimate.
 
 Never report completion just because `az deployment group create` returned. Confirm VM provisioning,
-NAT association/egress, Bastion connectivity, successful cloud-init, Docker daemon/Buildx/Compose
+the selected access mode, egress and SSH connectivity, successful cloud-init, Docker daemon/Buildx/Compose
 readiness, and (for GPU) `nvidia-smi`. Then perform the separately approved post-creation disk
 preparation and verify mounts, UUID persistence and administrator write access before claiming
 storage readiness. Cloud-init runs asynchronously on first boot; it is not a
@@ -256,3 +283,5 @@ test without accessing the user's private key, let the user perform it and mark 
 At handoff, list each disk's role, filesystem UUID, mount point and usable capacity, or explicitly
 identify raw/unmounted disks when preparation was declined or failed. Explain temporary disk loss,
 manual re-preparation after scratch loss, E70 backup requirements and ongoing costs.
+For private access verify NAT association, Bastion connectivity and no VM public IP; for demos
+verify the NIC-attached Standard static public IP, approved SSH source rule and absence of NAT/Bastion.

@@ -54,7 +54,8 @@ rejected. CPU image controller capabilities are parsed as comma-separated tokens
 trimmed, and must explicitly include `NVMe`.
 
 Collect an accountable owner/team identifier, not credentials or personal contact details. The required
-`owner` parameter tags all seven top-level AVM resources; the resource-group command below applies
+`owner` parameter tags every deployed top-level AVM resource (seven private-mode modules or four
+demo-mode modules, with NIC/disks inside the VM module); the resource-group command below applies
 the same tag to the group. A tag does not grant RBAC access. Requests generated before this field
 was added must be regenerated with an owner and reviewed.
 
@@ -102,7 +103,8 @@ of complete CCC compliance or customer-managed key coverage.
 ### PAYG cost review
 
 Before choosing a size, run `onboarding.py prices --compute cpu --location westus2 --subscription <UUID>`
-(substitute the confirmed subscription and chosen mode/region). This uses Azure login for read-only
+(substitute the confirmed subscription and chosen compute/region) with `--access-mode bastion` or
+`--access-mode public-ip` matching the user's access choice. This uses Azure login for read-only
 compute eligibility/quota selection but needs no SSH keys. Present each selected profile's VM USD/hour,
 VM USD/month and whole-environment **base** USD/month, plus the shared-resource breakdown.
 Disclose unavailable sizes from `skuSelection` and their reasons; they have no price and must not
@@ -117,12 +119,16 @@ The calculation uses current [Azure Retail Prices](https://learn.microsoft.com/r
 in USD, Linux on-demand Consumption rates and 730 VM hours/month. Disks use monthly capacity
 meters: E70 LRS Disk (16 TiB Standard SSD), P10 LRS Disk (128 GiB Premium OS). Do not select shared-disk
 `Disk Mount` or legacy Page Blob meters. Bastion Standard's base hourly rate **already includes two
-scale units**; do not double it. Two separate Standard IPv4 IPs are billed. NAT's published public-cloud
-meter is explicitly `Global`, not another region substituted for missing regional pricing.
+scale units**; do not double it. In recommended `bastion` mode, two separate Standard IPv4 IPs
+are billed, and NAT's published public-cloud meter is explicitly `Global`, not another region
+substituted for missing regional pricing. Demo `public-ip` mode bills one Standard static IPv4
+attached to the VM and neither deploys nor prices Bastion/NAT. Missing prices for undeployed
+services must not block demo pricing, but VM, disk and public-IP prices remain mandatory.
 VNet, subnets, NSG and NIC have no separate fixed hourly charge in this architecture.
 
-Label totals as estimates excluding usage, not all-inclusive bills: NAT processes **both outbound
-and return traffic**, Azure bandwidth and Bastion transfer can add charges, and Standard SSD disk
+Label totals as estimates excluding usage, not all-inclusive bills: when deployed, NAT processes
+**both outbound and return traffic** and Bastion transfer can add charges. In both modes Azure
+bandwidth and Standard SSD disk
 transactions are usage-based. No taxes, negotiated discounts, credits, reservations or savings plans
 are assumed. All fixed disks/network services keep billing during VM deallocation. The baseline
 assumes no deallocation; if discussing schedules, do not prorate those fixed charges away.
@@ -145,7 +151,7 @@ az deployment group what-if --subscription $subscription --resource-group $resou
 Stop if validation fails or what-if proposes modifying/deleting unrelated resources. Rerun the helper
 `check` against generated config **and** parameters to detect changes and refresh prices, quota and
 permissions. A check failure blocks deployment. Then show the what-if, subscription, region, owner,
-Bastion access, all resources and the **fresh itemized PAYG base estimate**, timestamp, 730-hour
+the selected access mode and demo SSH source restriction, all resources and the **fresh itemized PAYG base estimate**, timestamp, 730-hour
 assumption, persistent charges and excluded usage/taxes. This review is the final step before asking
 the user to approve deployment. Any changed price or configuration requires renewed approval.
 File generation or resource-group approval is not VM deployment approval. Only then deploy:
@@ -160,6 +166,10 @@ and actual resources; do not say that a failure automatically rolled everything 
 
 ## SSH and VS Code
 
+### Recommended: private Bastion plus NAT
+
+`accessMode: "bastion"` is the default bundled private-access option. Deploy Bastion Standard,
+NAT and their two separate Standard static public IPs; never attach a public IP to the VM.
 The user needs Reader access on the VM/NIC/Bastion resources and permission to use the selected
 subscription. The deploying identity needs resource creation permissions; do not grant Owner by default.
 Keep every Azure command scoped to the approved subscription.
@@ -202,10 +212,55 @@ multiple environments using the same localhost tunnel port. No inbound SSH publi
 If using the tool host to start a tunnel, expose it in an interactive terminal; do not claim a tunnel
 on a remote execution host is available on the user's laptop.
 
+### Demo only: direct Standard public IP
+
+For an explicitly chosen demo, set `accessMode: "public-ip"` and require `sshSourceCidr` to be
+the approved administrator IPv4 CIDR (prefer a single public egress address `/32`). Do not guess it
+or query an external IP service without consent. Never use `0.0.0.0/0`, `*` or an IPv6 source.
+The helper validates this restriction before generation/recheck. In Bastion mode omit this field
+or leave it empty. The unused Bastion subnet is not deployed or validated in demo mode.
+All resources still use AVM, and password authentication remains disabled.
+
+The demo inventory is one VNet/VM subnet, NSG, VM with NIC/disks and one Standard static public IP
+attached to that NIC. No NAT, Bastion, Bastion subnet or second public IP is deployed. The public
+IP supplies explicit egress with subnet default outbound access disabled. Only TCP 22 is allowed
+from the approved CIDR; all other inbound traffic remains denied, including application ports
+and the Docker API. This is a demo tradeoff, not the recommended private architecture.
+Provider/region, quota and reported-action checks omit NAT/Bastion and require one public IP.
+
+Use the deployment's `vmPublicIp` output, not `bastionName` (empty in demo mode). In a user-owned terminal:
+
+```powershell
+ssh -i "$HOME\.ssh\perspicacity" '<username>@<vm-public-ip>'
+```
+
+Verify the first-use host fingerprint through the same authorized Run Command described above;
+do not disable host-key checking. For VS Code Remote SSH, with permission add:
+
+```sshconfig
+Host perspicacity-demo
+    HostName <vm-public-ip>
+    Port 22
+    User <username>
+    IdentityFile ~/.ssh/perspicacity
+    HostKeyAlias <unique-vm-name>
+    IdentitiesOnly yes
+```
+
+No tunnel or Bastion extension is needed. If the user's public egress address changes, SSH is
+expected to fail until a separately reviewed/authorized NSG source change; never widen the rule
+to the whole internet to restore access. The helper is new-environment-only, not an in-place
+network migration tool. Deleting the VM alone may leave the public IP and other billable resources.
+
 ## Validate the deployed environment
 
-Check VM provisioning and power state, both subnets, the VM subnet's NAT association, and NIC absence
-of a public IP. Verify that the deployed VM's `securityProfile.encryptionAtHost` is `true` using
+Check VM provisioning and power state and deployment output `deployedAccessMode` against approved config.
+In private mode verify both subnets, the VM subnet's NAT association, Bastion Standard/native-client
+connectivity and NIC absence of a public IP. In demo mode verify only the VM subnet is deployed,
+no NAT is associated, no Bastion exists, and the NIC is attached to exactly the approved Standard
+static IPv4 public IP. Check the effective NSG allows TCP 22 only from the reviewed `sshSourceCidr`
+and denies other inbound traffic. In both modes verify subnet default outbound access is disabled.
+Verify that the deployed VM's `securityProfile.encryptionAtHost` is `true` using
 `az vm show --subscription <subscription-UUID> --resource-group <resource-group> --name <vm-name> --query securityProfile.encryptionAtHost`.
 Inside the VM, the user should verify internet egress with a trusted public-IP service
 and compare it with `outboundPublicIp` from deployment outputs. This contacts that service; obtain
@@ -219,8 +274,8 @@ single fail-fast command sequence. The exact document is saved as `infra\cloud-i
 and embedded in the VM parameters. Docker runs first; GPU host-driver setup follows only on GPU
 profiles. A failed script stops the sequence and must not be reported as ready.
 
-ARM provisioning success does not mean cloud-init or Docker is ready. From the user-owned Bastion
-SSH session, run these checks inside every VM:
+ARM provisioning success does not mean cloud-init or Docker is ready. From the user-owned SSH
+session (Bastion tunnel or direct demo IP), run these checks inside every VM:
 
 ```bash
 sudo cloud-init status --wait
@@ -243,7 +298,7 @@ No Docker Hub image is pulled or application container started automatically.
 
 Docker stays on its local Unix socket. Use `sudo`; adding a user to `docker` grants root-equivalent
 access and requires a separate, explicit decision. No Docker TCP listener or inbound container ports
-are configured. Keep NSG/Bastion restrictions in place if containers are introduced later.
+are configured. Keep the selected mode's NSG/access restrictions in place if containers are introduced later.
 Docker's default data directory stays on the OS disk (`/var/lib/docker`), not the E70 disk or
 temporary NVMe. Cloud-init does not format or mount disks. The separate post-creation disk step below
 does not move Docker storage or change Docker's configuration.
@@ -283,7 +338,7 @@ If the documentation disagrees or installation fails, surface the mismatch rathe
 Make this a normal onboarding step after VM creation, successful cloud-init and Docker/GPU readiness,
 not an unattended first-boot action. This prepares disks on the environment just created by this flow;
 it does not authorize adopting, reformatting or changing storage on other VMs. Updating the skill or
-generated files does not modify an already-running VM. Use the user-owned Bastion SSH session, or
+generated files does not modify an already-running VM. Use the user-owned SSH session (Bastion or direct demo IP), or
 Azure Run Command with permission for the guest inspection and subsequent approved mutations.
 
 The data disk is **E70: 16,384 GiB StandardSSD_LRS**, LUN 0, caching None. This is separate from both
@@ -403,6 +458,6 @@ Detached disks keep billing and still need backups if the data matters.
 ## Stop and cleanup
 
 Stopping/deallocating a VM can erase temporary NVMe data. Warn and confirm before doing it.
-It does not stop Bastion/NAT/public-IP/disk charges. For full cleanup, inventory the environment,
+It does not stop charges for deployed Bastion/NAT, static public IPs or disks. For full cleanup, inventory the environment,
 arrange backup/export of durable data, show all resources that would be deleted, and ask for
 explicit confirmation before deleting anything. Never automatically delete the resource group.

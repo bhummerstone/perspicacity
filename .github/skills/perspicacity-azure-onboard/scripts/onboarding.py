@@ -30,6 +30,8 @@ DEFAULTS = {
     "compute": "cpu",
     "size": PROFILES["defaultSize"],
     "vmSize": "auto",
+    "accessMode": "bastion",
+    "sshSourceCidr": "",
     "vnetCidr": "192.168.0.0/24",
     "bastionSubnetCidr": "192.168.0.0/26",
     "vmSubnetCidr": "192.168.0.64/26",
@@ -116,7 +118,10 @@ def prerequisites():
 
 def validate_networks(config):
     networks = {}
-    for key in ("vnetCidr", "bastionSubnetCidr", "vmSubnetCidr"):
+    keys = ["vnetCidr", "vmSubnetCidr"]
+    if config["accessMode"] == "bastion":
+        keys.append("bastionSubnetCidr")
+    for key in keys:
         try:
             network = ipaddress.ip_network(config[key], strict=True)
         except ValueError as exc:
@@ -124,16 +129,33 @@ def validate_networks(config):
         if network.version != 4 or not any(network.subnet_of(private) for private in PRIVATE_NETWORKS):
             raise OnboardingError(f"{key} must be an aligned RFC1918 private IPv4 CIDR.")
         networks[key] = network
-    vnet, bastion, vm = (networks[key] for key in ("vnetCidr", "bastionSubnetCidr", "vmSubnetCidr"))
-    if bastion.prefixlen > 26:
-        raise OnboardingError("AzureBastionSubnet must be /26 or larger.")
+    vnet, vm = networks["vnetCidr"], networks["vmSubnetCidr"]
     if vm.prefixlen > 29:
         raise OnboardingError("The VM subnet must be /29 or larger to leave usable Azure addresses.")
-    if not bastion.subnet_of(vnet) or not vm.subnet_of(vnet):
-        raise OnboardingError("Both subnets must be contained in vnetCidr.")
-    if bastion.overlaps(vm):
-        raise OnboardingError("The Bastion and VM subnets must not overlap.")
+    if any(not network.subnet_of(vnet) for network in networks.values()):
+        raise OnboardingError("All deployed subnets must be contained in vnetCidr.")
+    if "bastionSubnetCidr" in networks:
+        bastion = networks["bastionSubnetCidr"]
+        if bastion.prefixlen > 26:
+            raise OnboardingError("AzureBastionSubnet must be /26 or larger.")
+        if bastion.overlaps(vm):
+            raise OnboardingError("The Bastion and VM subnets must not overlap.")
     return networks
+
+
+def validate_access(access_mode, ssh_source_cidr):
+    if access_mode not in ("bastion", "public-ip"):
+        raise OnboardingError("accessMode must be bastion (recommended) or public-ip (demo only).")
+    if access_mode == "bastion":
+        if ssh_source_cidr:
+            raise OnboardingError("sshSourceCidr is only used with accessMode public-ip.")
+        return
+    try:
+        source = ipaddress.ip_network(ssh_source_cidr, strict=True)
+    except ValueError as exc:
+        raise OnboardingError("public-ip mode requires sshSourceCidr: an aligned administrator IPv4 CIDR, preferably /32.") from exc
+    if source.version != 4 or source.prefixlen == 0:
+        raise OnboardingError("sshSourceCidr must be a restricted IPv4 CIDR, never 0.0.0.0/0.")
 
 
 def read_config(path):
@@ -145,8 +167,9 @@ def read_config(path):
     if missing or unknown:
         raise OnboardingError(f"Missing fields: {sorted(missing)}; unknown fields: {sorted(unknown)}.")
     config = {**DEFAULTS, **raw}
-    if any(not isinstance(value, str) or not value for value in config.values()):
-        raise OnboardingError("All configuration values must be nonempty strings.")
+    if any(not isinstance(value, str) or (not value and key != "sshSourceCidr") for key, value in config.items()):
+        raise OnboardingError("All configuration values must be nonempty strings except optional sshSourceCidr.")
+    validate_access(config["accessMode"], config["sshSourceCidr"])
     try:
         config["subscriptionId"] = str(uuid.UUID(config["subscriptionId"]))
     except ValueError as exc:
@@ -407,11 +430,12 @@ def check_permissions(config, group_exists):
         "Microsoft.Compute/disks/write",
         *[f"Microsoft.Network/{resource}/write" for resource in (
             "virtualNetworks", "virtualNetworks/subnets", "networkInterfaces",
-            "networkSecurityGroups", "publicIPAddresses", "natGateways", "bastionHosts",
+            "networkSecurityGroups", "publicIPAddresses",
+            *(("natGateways", "bastionHosts") if config["accessMode"] == "bastion" else ()),
         )],
         *[f"Microsoft.Network/{resource}/join/action" for resource in (
             "virtualNetworks/subnets", "networkInterfaces", "networkSecurityGroups",
-            "publicIPAddresses", "natGateways",
+            "publicIPAddresses", *(("natGateways",) if config["accessMode"] == "bastion" else ()),
         )],
     ]
     def matches(action, patterns):
@@ -430,7 +454,7 @@ def check_permissions(config, group_exists):
     return {"scope": scope, "requiredActions": required, "status": "ReportedActionsAllowed"}
 
 
-def retail_prices(location, profiles):
+def retail_prices(location, profiles, access_mode="bastion"):
     if not re.fullmatch(r"[a-z][a-z0-9]+", location):
         raise OnboardingError("Use a region code such as westus2.")
     # The service rejects long OData URLs; batch at most four exact SKUs per query.
@@ -438,18 +462,22 @@ def retail_prices(location, profiles):
         names = list(profiles)
         return [
             row for offset in range(0, len(names), 4)
-            for row in retail_prices(location, {name: profiles[name] for name in names[offset:offset + 4]})
+            for row in retail_prices(location, {name: profiles[name] for name in names[offset:offset + 4]}, access_mode)
         ]
     skus = " or ".join(f"armSkuName eq '{profile['sku']}'" for profile in profiles.values())
     regional = (
         f"(serviceName eq 'Virtual Machines' and ({skus})) or "
         "(serviceName eq 'Storage' and (skuName eq 'E70 LRS' or skuName eq 'P10 LRS')) or "
-        "(serviceName eq 'Azure Bastion' and skuName eq 'Standard') or "
         "(serviceName eq 'Virtual Network' and productName eq 'IP Addresses' and skuName eq 'Standard')"
     )
+    if access_mode == "bastion":
+        regional += " or (serviceName eq 'Azure Bastion' and skuName eq 'Standard')"
+    nat_filter = (
+        " or (serviceName eq 'NAT Gateway' and skuName eq 'Standard' and armRegionName eq 'Global')"
+        if access_mode == "bastion" else ""
+    )
     filters = (
-        f"priceType eq 'Consumption' and ((armRegionName eq '{location}' and ({regional})) or "
-        "(serviceName eq 'NAT Gateway' and skuName eq 'Standard' and armRegionName eq 'Global'))"
+        f"priceType eq 'Consumption' and ((armRegionName eq '{location}' and ({regional})){nat_filter})"
     )
     url = "https://prices.azure.com/api/retail/prices?" + urllib.parse.urlencode({
         "$filter": filters, "currencyCode": "'USD'",
@@ -467,10 +495,13 @@ def retail_prices(location, profiles):
     return rows
 
 
-def estimate_costs(location, profiles):
+def estimate_costs(location, profiles, access_mode="bastion"):
     """Return a live USD PAYG base estimate, not an all-inclusive bill or capacity check."""
     now = dt.datetime.now(dt.timezone.utc)
-    rows = retail_prices(location, profiles)
+    if access_mode not in ("bastion", "public-ip"):
+        raise OnboardingError("accessMode must be bastion or public-ip.")
+    private_access = access_mode == "bastion"
+    rows = retail_prices(location, profiles, access_mode)
     def meter(label, unit, region=None, **fields):
         region = region or location
         candidates = [
@@ -503,13 +534,21 @@ def estimate_costs(location, profiles):
     def money(value):
         return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     shared = []
-    for label, service, product, name, unit, quantity, region in (
+    meters = [
         ("E70 16 TiB Standard SSD LRS", "Storage", "Standard SSD Managed Disks", "E70 LRS Disk", "1/Month", 1, location),
         ("P10 128 GiB Premium SSD LRS OS disk", "Storage", "Premium SSD Managed Disks", "P10 LRS Disk", "1/Month", 1, location),
-        ("Bastion Standard (two included scale units)", "Azure Bastion", "Azure Bastion", "Standard Gateway", "1 Hour", 1, location),
-        ("Standard NAT Gateway", "NAT Gateway", "NAT Gateway", "Standard Gateway", "1 Hour", 1, "Global"),
-        ("Two Standard static IPv4 addresses", "Virtual Network", "IP Addresses", "Standard IPv4 Static Public IP", "1 Hour", 2, location),
-    ):
+    ]
+    if private_access:
+        meters.extend([
+            ("Bastion Standard (two included scale units)", "Azure Bastion", "Azure Bastion", "Standard Gateway", "1 Hour", 1, location),
+            ("Standard NAT Gateway", "NAT Gateway", "NAT Gateway", "Standard Gateway", "1 Hour", 1, "Global"),
+        ])
+    meters.append((
+        "Two Standard static IPv4 addresses" if private_access else "One Standard static IPv4 address (VM)",
+        "Virtual Network", "IP Addresses", "Standard IPv4 Static Public IP", "1 Hour",
+        2 if private_access else 1, location,
+    ))
+    for label, service, product, name, unit, quantity, region in meters:
         row, rate = meter(label, unit, region, serviceName=service, productName=product, meterName=name)
         monthly = rate * quantity * (730 if unit == "1 Hour" else 1)
         shared.append({
@@ -528,24 +567,32 @@ def estimate_costs(location, profiles):
         }
     return {
         "checkedAtUtc": now.isoformat(), "source": "https://prices.azure.com/api/retail/prices",
-        "location": location, "currency": "USD", "priceType": "Consumption", "hoursPerMonth": 730,
+        "location": location, "accessMode": access_mode,
+        "currency": "USD", "priceType": "Consumption", "hoursPerMonth": 730,
         "sharedResources": shared, "sharedMonthlyUsd": money(fixed), "profiles": sizes,
         "assumptions": [
             "Base estimate assumes 730 VM hours/month and the fixed infrastructure exists all month.",
-            "Bastion base price includes two scale units; do not multiply it by two.",
-            "NAT uses Azure's explicitly Global public-cloud meter, not a different region's price.",
-            "Disks, Bastion, NAT and public IPs keep billing when the VM is deallocated.",
+            *([
+                "Bastion base price includes two scale units; do not multiply it by two.",
+                "NAT uses Azure's explicitly Global public-cloud meter, not a different region's price.",
+            ] if private_access else ["Demo mode has one NIC-attached Standard static public IP; no Bastion or NAT."]),
+            "Disks and deployed network services/public IPs keep billing when the VM is deallocated.",
             "No Spot, reservations, savings plans, negotiated discounts, credits or taxes.",
         ],
         "excludedUsage": [
-            "NAT processing of outbound AND return traffic, plus Azure bandwidth charges.",
-            "Bastion data transfer and Standard SSD disk transactions.",
+            *([
+                "NAT processing of outbound AND return traffic.",
+                "Bastion data transfer.",
+            ] if private_access else []),
+            "Azure bandwidth charges and Standard SSD disk transactions.",
             "Backups, extra monitoring/log storage and any additional services.",
         ],
     }
 
 
 def preflight(config, pinned_image=None):
+    validate_access(config["accessMode"], config["sshSourceCidr"])
+    private_access = config["accessMode"] == "bastion"
     subscription, location = config["subscriptionId"], config["location"]
     if az("cloud", "show")["name"] != "AzureCloud":
         raise OnboardingError("These public-cloud AVM/image profiles currently support AzureCloud only.")
@@ -562,8 +609,8 @@ def preflight(config, pinned_image=None):
         raise OnboardingError(f"{location} is not an available subscription region.")
     services = {
         "Microsoft.Compute": ("virtualMachines", "disks"),
-        "Microsoft.Network": ("virtualNetworks", "bastionHosts", "natGateways", "publicIPAddresses",
-                              "networkSecurityGroups", "networkInterfaces"),
+        "Microsoft.Network": ("virtualNetworks", "publicIPAddresses", "networkSecurityGroups",
+                              "networkInterfaces", *(("bastionHosts", "natGateways") if private_access else ())),
     }
     for namespace, resource_types in services.items():
         provider = az("provider", "show", "--namespace", namespace, subscription=subscription)
@@ -598,11 +645,14 @@ def preflight(config, pinned_image=None):
     skus, usages = compute_inventory(subscription, location, config["compute"])
     profile, quotas, selection = select_compute(config, skus, usages)
     network_usages = az("network", "list-usages", "--location", location, subscription=subscription)
+    ip_count = 2 if private_access else 1
     network_needs = {
         "virtualnetworks": 1, "networksecuritygroups": 1, "networkinterfaces": 1,
-        "natgateways": 1, "bastionhosts": 1, "publicipaddresses": 2,
-        "publicipaddressesstandard": 2, "standardpublicipaddresses": 2, "staticpublicipaddresses": 2,
+        "publicipaddresses": ip_count, "publicipaddressesstandard": ip_count,
+        "standardpublicipaddresses": ip_count, "staticpublicipaddresses": ip_count,
     }
+    if private_access:
+        network_needs.update(natgateways=1, bastionhosts=1)
     requirements = {}
     for row in network_usages:
         normalized = re.sub(r"[^a-z]", "", row["name"]["value"].lower())
@@ -618,6 +668,8 @@ def preflight(config, pinned_image=None):
         "resourceGroup": config["resourceGroup"],
         "location": location,
         "owner": config["owner"],
+        "accessMode": config["accessMode"],
+        "sshSourceCidr": config["sshSourceCidr"],
         "permissionCheck": permission_report,
         "profile": profile,
         "skuSelection": selection,
@@ -666,6 +718,7 @@ def parameters(config, image, public_key):
         "computeMode": config["compute"], "imageReference": image,
         "encryptionAtHost": True,
         "owner": config["owner"],
+        "accessMode": config["accessMode"], "sshSourceCidr": config["sshSourceCidr"],
         "vnetCidr": config["vnetCidr"], "bastionSubnetCidr": config["bastionSubnetCidr"],
         "vmSubnetCidr": config["vmSubnetCidr"],
         "customData": cloud_init(config["compute"]),
@@ -729,6 +782,8 @@ def main():
     parser.add_argument("--location", default=PROFILES["defaultLocation"], help="Region for prices.")
     parser.add_argument("--compute", choices=("cpu", "gpu", "all"), default="all", help="Profile family for prices.")
     parser.add_argument("--subscription", help="For prices: select quota-eligible SKUs using this subscription UUID.")
+    parser.add_argument("--access-mode", choices=("bastion", "public-ip"),
+                        help="For prices: bastion plus NAT (default), or public-ip demo. generate/check use config.")
     parser.add_argument("--output", type=Path, default=Path(".azure-vm") / "dev")
     parser.add_argument("--parameters", type=Path, help="Recheck an existing generated parameter file without upgrading its image.")
     args = parser.parse_args()
@@ -768,7 +823,7 @@ def main():
                             profiles[f"{name}-{profile['sku']}" if compute == "cpu" else name] = profile
             if not profiles:
                 raise OnboardingError("No quota-eligible T-shirt options:\n" + json.dumps(selections, indent=2))
-            report = estimate_costs(args.location, profiles)
+            report = estimate_costs(args.location, profiles, args.access_mode or DEFAULTS["accessMode"])
             if args.subscription:
                 report.update(subscriptionId=args.subscription, skuSelection=selections)
             print(json.dumps(report, indent=2))
@@ -777,6 +832,8 @@ def main():
             raise OnboardingError("--config is required for generate/check.")
         if args.subscription:
             raise OnboardingError("generate/check use the subscriptionId in --config, not --subscription.")
+        if args.access_mode:
+            raise OnboardingError("generate/check use accessMode in --config, not --access-mode.")
         config = read_config(args.config.resolve())
         public_key = read_public_key(config["sshPublicKeyPath"])
         pinned = None
@@ -796,7 +853,7 @@ def main():
             raise OnboardingError("Parameters differ from the approved config/key/profile. Regenerate in a new directory.")
         report["costEstimate"] = estimate_costs(config["location"], {
             config["size"]: report["profile"],
-        })
+        }, config["accessMode"])
         if args.action == "generate":
             generate(config, report, public_key, args.output.resolve())
         print(json.dumps(report, indent=2))

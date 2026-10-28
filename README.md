@@ -13,7 +13,9 @@ The agent guides you through subscription, CPU/GPU, region, priced Small/Medium/
 owner/team, username, local SSH keys and private IP addressing. It generates configuration, checks
 live Azure availability, quota and reported deployment permissions, and requires separate approval
 of the fresh itemized PAYG estimate before deploying billable resources. Bastion SSH/VS Code remains
-the secure default. Docker Engine is installed on first boot. After VM creation and software readiness,
+the secure default, bundled with NAT Gateway. A direct Standard public IP is also available for demos,
+with SSH restricted to an explicitly approved administrator IPv4 CIDR. Docker Engine is installed
+on first boot. After VM creation and software readiness,
 the agent identifies disks and requests separate formatting approval before preparing data/scratch
 mounts. Application containers and data-source integrations remain out of scope.
 To use it in another repository, copy the entire `.github/skills/perspicacity-azure-onboard` directory,
@@ -21,7 +23,13 @@ including its assets, references and Python helper, into that repository's skill
 
 **Defaults:** West US 2, Small CPU, VNet `192.168.0.0/24`, Bastion subnet `192.168.0.0/26`,
 VM subnet `192.168.0.64/26`. Bastion **Standard** supports local SSH/VS Code.
-The VM has no public IP; NAT supplies a static outbound IP. SSH keys stay local; there is no Key Vault.
+The default VM has no public IP; NAT supplies a static outbound IP. SSH keys stay local; there is no Key Vault.
+
+**Demo option:** set `"accessMode": "public-ip"` and `"sshSourceCidr": "<your-public-IPv4>/32"`
+in the request. This deploys one Standard static public IP directly on the VM NIC, with no NAT,
+Bastion or Bastion subnet. Only SSH from that source is allowed; internet-wide SSH, application
+ports and the Docker API are not opened. All infrastructure in both options uses AVM.
+Omitting `accessMode` preserves the recommended `"bastion"` (Bastion plus NAT) architecture.
 
 ## Compute and storage
 
@@ -113,8 +121,11 @@ If none qualify, it fails without a fabricated price. Generation still runs full
 The skill shows these costs alongside
 the T-shirt specifications, then refreshes the selected profile at generation and again as the
 final step before deployment approval. Missing or ambiguous prices block the flow.
+Pass `--access-mode public-ip` to price the demo option; the default is `--access-mode bastion`.
+Pricing, provider/region checks, permissions and network quotas all follow the selected architecture.
+Demo estimates retain both disks but include only one public IP and no NAT/Bastion charges or rates.
 
-**Example snapshot: West US 2, 23 October 2026, USD PAYG, 730 VM hours/month. CPU rates are Intel Ddsv7 only.**
+**Private-mode example snapshot: West US 2, 23 October 2026, USD PAYG, 730 VM hours/month. CPU rates are Intel Ddsv7 only.**
 Monthly figures include the VM, both disks, Bastion Standard, NAT and two static public IPv4s;
 they exclude usage-based charges and taxes. Rerun the command; this table is not a live quote.
 
@@ -184,13 +195,14 @@ python .github\skills\perspicacity-azure-onboard\scripts\onboarding.py check --c
 **Availability and quota are checked for every region, including the default.** Insufficient quota,
 SKU restrictions, image incompatibility or missing permissions stop the flow. Sufficient quota does
 not guarantee physical capacity; ARM validation/what-if and user confirmation are still required.
-Access is through Bastion, with no VPN or VNet peering. Onboarding does not ask about or check
+Access is through Bastion by default, or direct SSH to the demo public IP, with no VPN or VNet peering.
+Onboarding does not ask about or check
 overlap with home or other networks; it still validates CIDR alignment, subnet containment and
-non-overlap between the Bastion and VM subnets.
+non-overlap between the Bastion and VM subnets when Bastion is deployed.
 
 See [operations](.github/skills/perspicacity-azure-onboard/references/operations.md) for deployment gates,
-Bastion tunneling, VS Code, GPU verification and safe disk handling.
-VM deallocation does **not** stop Bastion, NAT, public-IP or managed-disk charges.
+Bastion tunneling or direct demo SSH, VS Code, GPU verification and safe disk handling.
+VM deallocation does **not** stop charges for deployed Bastion/NAT, static public IPs or managed disks.
 E70 provisions 16 TiB even on Small; review current costs before deploying.
 
 ## Development

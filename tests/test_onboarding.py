@@ -160,6 +160,13 @@ class NetworkTests(unittest.TestCase):
         })
         self.assertEqual(str(result["vmSubnetCidr"]), "10.20.0.128/25")
 
+    def test_demo_does_not_require_an_unused_bastion_subnet(self):
+        result = onboarding.validate_networks({
+            **CONFIG, "accessMode": "public-ip", "vnetCidr": "10.0.0.0/29",
+            "vmSubnetCidr": "10.0.0.0/29",
+        })
+        self.assertEqual(set(result), {"vnetCidr", "vmSubnetCidr"})
+
 
 class ConfigTests(unittest.TestCase):
     def read(self, changes=None, remove=()):
@@ -177,6 +184,26 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["size"], "small")
         self.assertEqual(config["compute"], "cpu")
         self.assertEqual(config["vmSize"], "auto")
+        self.assertEqual(config["accessMode"], "bastion")
+        self.assertEqual(config["sshSourceCidr"], "")
+
+    def test_public_ip_demo_requires_explicit_restricted_ssh_source(self):
+        for cidr in ("203.0.113.42/32", "203.0.113.0/24"):
+            config = self.read({"accessMode": "public-ip", "sshSourceCidr": cidr})
+            self.assertEqual(config["sshSourceCidr"], cidr)
+        for change in (
+            {"accessMode": "invalid"},
+            {"accessMode": "public-ip"},
+            {"accessMode": "public-ip", "sshSourceCidr": "0.0.0.0/0"},
+            {"accessMode": "public-ip", "sshSourceCidr": "*"},
+            {"accessMode": "public-ip", "sshSourceCidr": "Internet"},
+            {"accessMode": "public-ip", "sshSourceCidr": "::/0"},
+            {"accessMode": "public-ip", "sshSourceCidr": "203.0.113.42/24"},
+            {"accessMode": "public-ip", "sshSourceCidr": None},
+            {"sshSourceCidr": "203.0.113.42/32"},
+        ):
+            with self.subTest(change=change), self.assertRaises(onboarding.OnboardingError):
+                self.read(change)
 
     def test_relative_public_key_path_is_relative_to_config(self):
         config = self.read({"sshPublicKeyPath": "keys/test.pub"})
@@ -706,6 +733,45 @@ class PreflightTests(unittest.TestCase):
         self.assertFalse(any(call.args[:3] == ("network", "vnet", "list") for call in azure.call_args_list))
         self.assertNotIn("overlappingVnets", report)
 
+    def test_demo_checks_only_deployed_network_services_permissions_and_one_ip(self):
+        config = {**CONFIG, "accessMode": "public-ip", "sshSourceCidr": "203.0.113.42/32"}
+        self.network_usage = [
+            usage("PublicIPAddresses", 9, 10), usage("NatGateways", 1, 1),
+            usage("BastionHosts", 1, 1),
+        ]
+        self.permission_entries = [{
+            "actions": ["*"],
+            "notActions": ["Microsoft.Network/natGateways/*", "Microsoft.Network/bastionHosts/*"],
+        }]
+        def demo_azure(*args, **kwargs):
+            result = self.azure(*args, **kwargs)
+            if args[:2] == ("provider", "show"):
+                result["resourceTypes"] = [
+                    row for row in result["resourceTypes"]
+                    if row["resourceType"] not in ("natGateways", "bastionHosts")
+                ]
+            return result
+        with patch.object(onboarding, "az", side_effect=demo_azure), patch.object(
+            onboarding, "resolve_image", return_value=IMAGE
+        ):
+            report = onboarding.preflight(config)
+        self.assertEqual(report["accessMode"], "public-ip")
+        self.assertEqual(report["sshSourceCidr"], config["sshSourceCidr"])
+        self.assertEqual(report["quotaChecks"][-1]["required"], 1)
+        self.assertEqual(len(report["quotaChecks"]), 4)
+        actions = " ".join(report["permissionCheck"]["requiredActions"]).lower()
+        self.assertNotIn("natgateways", actions)
+        self.assertNotIn("bastionhosts", actions)
+        self.network_usage = [usage("StandardPublicIpAddresses", 10, 10)]
+        with self.assertRaisesRegex(onboarding.OnboardingError, "Insufficient"):
+            self.run_check(config)
+
+    def test_invalid_demo_access_fails_before_any_azure_call(self):
+        with patch.object(onboarding, "az", side_effect=AssertionError("Must validate before Azure")), self.assertRaisesRegex(
+            onboarding.OnboardingError, "sshSourceCidr"
+        ):
+            onboarding.preflight({**CONFIG, "accessMode": "public-ip"})
+
 
 class GenerationTests(unittest.TestCase):
     def report(self):
@@ -720,6 +786,65 @@ class GenerationTests(unittest.TestCase):
         self.assertIn("    encryptionAtHost: encryptionAtHost\n", template)
         self.assertNotIn("diskEncryptionSetResourceId", template)
         self.assertNotIn("avm/res/key-vault/", template)
+
+    def test_template_uses_avm_for_both_exclusive_access_architectures(self):
+        template = (onboarding.ASSETS / "infra" / "main.bicep").read_text(encoding="utf-8")
+        self.assertNotRegex(template, r"(?m)^resource ")
+        self.assertEqual(template.count("= if (privateAccess) {"), 3)
+        self.assertIn("param accessMode string = 'bastion'", template)
+        self.assertIn("natGatewayResourceId: privateAccess ? nat!.outputs.resourceId : null", template)
+        self.assertIn("pipConfiguration: privateAccess ? null : {", template)
+        self.assertIn("publicIPAddressResourceId: outboundIp.outputs.resourceId", template)
+        self.assertIn("sourceAddressPrefix: privateAccess ? bastionSubnetCidr : sshSourceCidr", template)
+        self.assertIn("defaultOutboundAccess: false", template)
+        self.assertIn("output vmPublicIp string = privateAccess ? '' : outboundIp.outputs.ipAddress", template)
+
+    def test_demo_generation_persists_access_and_source_in_config_parameters_and_report(self):
+        config = {**CONFIG, "accessMode": "public-ip", "sshSourceCidr": "203.0.113.42/32"}
+        report = {**self.report(), "accessMode": "public-ip", "sshSourceCidr": config["sshSourceCidr"]}
+        template = (onboarding.ASSETS / "infra" / "main.bicep").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "demo"
+            with patch.object(onboarding, "refresh_modules", return_value=(template, {})), patch.object(
+                onboarding, "command", side_effect=lambda args: Path(args[-1]).write_text("{}")
+            ):
+                onboarding.generate(config, report, PUBLIC_KEY, output)
+            self.assertEqual(json.loads((output / "config.json").read_text()), config)
+            values = json.loads((output / "main.parameters.json").read_text())["parameters"]
+            self.assertEqual(values["accessMode"]["value"], "public-ip")
+            self.assertEqual(values["sshSourceCidr"]["value"], config["sshSourceCidr"])
+            self.assertEqual(json.loads((output / "preflight.json").read_text())["accessMode"], "public-ip")
+
+    def test_demo_final_check_prices_approved_mode_and_rejects_source_or_mode_drift(self):
+        for compute in ("cpu", "gpu"):
+            config = {
+                **CONFIG, "compute": compute, "vmSize": reference_profiles(compute)["small"]["sku"],
+                "accessMode": "public-ip", "sshSourceCidr": "203.0.113.42/32",
+            }
+            report = {**self.report(), "profile": reference_profiles(compute)["small"]}
+            for drift in (None, "sshSourceCidr", "accessMode"):
+                with self.subTest(compute=compute, drift=drift), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "main.parameters.json"
+                    values = onboarding.parameters(config, IMAGE, PUBLIC_KEY)
+                    if drift:
+                        values["parameters"][drift]["value"] = (
+                            "203.0.113.43/32" if drift == "sshSourceCidr" else "bastion"
+                        )
+                    path.write_text(json.dumps(values), encoding="utf-8")
+                    with patch("sys.argv", [
+                        "onboarding.py", "check", "--config", "unused.json", "--parameters", str(path),
+                    ]), patch.object(onboarding, "read_config", return_value=config), patch.object(
+                        onboarding, "read_public_key", return_value=PUBLIC_KEY
+                    ), patch.object(onboarding, "preflight", return_value=report), patch.object(
+                        onboarding, "estimate_costs", return_value={}
+                    ) as estimate, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        self.assertEqual(onboarding.main(), 1 if drift else 0)
+                    if drift:
+                        estimate.assert_not_called()
+                    else:
+                        estimate.assert_called_once_with(
+                            config["location"], {"small": report["profile"]}, "public-ip",
+                        )
 
     def test_parameters_match_all_eight_profiles_and_only_public_key(self):
         for compute in ("cpu", "gpu"):
@@ -820,7 +945,8 @@ class GenerationTests(unittest.TestCase):
                 preflight.assert_not_called()
 
     def test_recheck_detects_parameter_drift(self):
-        for changed in (None, "size", "owner", "missing-host-encryption", "disabled-host-encryption", "missing-docker"):
+        for changed in (None, "size", "owner", "missing-host-encryption", "disabled-host-encryption",
+                        "missing-docker", "access", "ssh-source", "missing-access"):
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "main.parameters.json"
                 parameters = onboarding.parameters(CONFIG, IMAGE, PUBLIC_KEY)
@@ -834,6 +960,12 @@ class GenerationTests(unittest.TestCase):
                     parameters["parameters"]["encryptionAtHost"]["value"] = False
                 elif changed == "missing-docker":
                     parameters["parameters"]["customData"]["value"] = ""
+                elif changed == "access":
+                    parameters["parameters"]["accessMode"]["value"] = "public-ip"
+                elif changed == "ssh-source":
+                    parameters["parameters"]["sshSourceCidr"]["value"] = "0.0.0.0/0"
+                elif changed == "missing-access":
+                    parameters["parameters"].pop("accessMode")
                 path.write_text(json.dumps(parameters), encoding="utf-8")
                 with patch("sys.argv", ["onboarding.py", "check", "--config", "unused.json",
                                         "--parameters", str(path)]), patch.object(
@@ -986,7 +1118,48 @@ class PricingTests(unittest.TestCase):
     def estimate(self, rows=None, config=None):
         config = config or CONFIG
         with patch.object(onboarding, "retail_prices", return_value=self.rows(config) if rows is None else rows):
-            return onboarding.estimate_costs(config["location"], reference_profiles(config["compute"]))
+            return onboarding.estimate_costs(config["location"], reference_profiles(config["compute"]), config["accessMode"])
+
+    def test_demo_prices_one_ip_no_nat_bastion_and_keeps_disks(self):
+        rows = [row for row in self.rows() if row["serviceName"] not in ("Azure Bastion", "NAT Gateway")]
+        report = self.estimate(rows=rows, config={**CONFIG, "accessMode": "public-ip"})
+        self.assertEqual(report["accessMode"], "public-ip")
+        self.assertEqual(report["sharedMonthlyUsd"], 1250.37)
+        self.assertEqual(report["profiles"]["small"]["baseMonthlyUsd"], 2203.02)
+        self.assertEqual(len(report["sharedResources"]), 3)
+        self.assertEqual(report["sharedResources"][-1]["quantity"], 1)
+        self.assertEqual(report["sharedResources"][-1]["monthlyUsd"], 3.65)
+        self.assertNotIn("NAT processing", " ".join(report["excludedUsage"]))
+        self.assertNotIn("Bastion data transfer", " ".join(report["excludedUsage"]))
+        with self.assertRaises(onboarding.OnboardingError):
+            self.estimate(rows=rows)
+        with self.assertRaises(onboarding.OnboardingError):
+            self.estimate(rows=[row for row in rows if row["serviceName"] != "Virtual Network"],
+                          config={**CONFIG, "accessMode": "public-ip"})
+
+    def test_demo_retail_queries_exclude_nat_and_bastion_in_every_batch(self):
+        profiles = {f"{size}-{profile['sku']}": profile for size in onboarding.PROFILES["cpu"]
+                    for profile in onboarding.profile_candidates("cpu", size)}
+        with patch.object(onboarding.urllib.request, "urlopen", side_effect=lambda *args, **kwargs: io.StringIO(
+            '{"Items": [], "NextPageLink": null}'
+        )) as fetch:
+            onboarding.retail_prices("westus2", profiles, "public-ip")
+        self.assertEqual(fetch.call_count, 4)
+        for call in fetch.call_args_list:
+            query = onboarding.urllib.parse.unquote(call.args[0])
+            self.assertNotIn("NAT", query)
+            self.assertNotIn("Bastion", query)
+            self.assertIn("IP+Addresses", query)
+
+    def test_demo_prices_cli_passes_selected_architecture_without_login(self):
+        with patch("sys.argv", ["onboarding.py", "prices", "--compute", "cpu", "--access-mode", "public-ip"]), patch.object(
+            onboarding, "estimate_costs", return_value={"accessMode": "public-ip"}
+        ) as estimate, patch.object(onboarding, "az", side_effect=AssertionError("Must not use login")), redirect_stdout(
+            io.StringIO()
+        ) as output:
+            self.assertEqual(onboarding.main(), 0)
+        self.assertEqual(estimate.call_args.args[2], "public-ip")
+        self.assertEqual(json.loads(output.getvalue())["accessMode"], "public-ip")
 
     def test_full_fixed_costs_and_all_sizes_use_decimal_totals_and_730_hours(self):
         report = self.estimate()
@@ -1084,7 +1257,7 @@ class PricingTests(unittest.TestCase):
         ), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(onboarding.main(), 0)
         inventory.assert_called_once_with(CONFIG["subscriptionId"], "westus2", "cpu")
-        estimate.assert_called_once_with("westus2", {"cpu-small": profiles[-1]})
+        estimate.assert_called_once_with("westus2", {"cpu-small": profiles[-1]}, "bastion")
         report = json.loads(output.getvalue())
         self.assertEqual(report["subscriptionId"], CONFIG["subscriptionId"])
         self.assertEqual(report["skuSelection"]["cpu-small"]["selectedSku"], "Standard_D16ads_v6")
@@ -1157,7 +1330,7 @@ class PricingTests(unittest.TestCase):
                     return_value={"fixture": True}
                 ) as estimate, patch.object(onboarding, "generate") as generate, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     self.assertEqual(onboarding.main(), 1 if fail else 0)
-                    estimate.assert_called_once_with(CONFIG["location"], {"small": reference_profiles("cpu")["small"]})
+                    estimate.assert_called_once_with(CONFIG["location"], {"small": reference_profiles("cpu")["small"]}, "bastion")
                     self.assertEqual(generate.called, action == "generate" and not fail)
 
     def test_generation_prices_the_selected_amd_v6_sku_not_the_reference_intel_v7(self):
@@ -1170,7 +1343,7 @@ class PricingTests(unittest.TestCase):
             onboarding, "generate"
         ) as generate, redirect_stdout(io.StringIO()):
             self.assertEqual(onboarding.main(), 0)
-        estimate.assert_called_once_with("westus2", {"small": profile})
+        estimate.assert_called_once_with("westus2", {"small": profile}, "bastion")
         self.assertEqual(generate.call_args.args[1]["profile"]["sku"], "Standard_D16ads_v6")
 
 
