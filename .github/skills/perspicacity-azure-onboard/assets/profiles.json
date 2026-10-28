@@ -1,0 +1,31 @@
+{
+  "defaultLocation": "westus2",
+  "defaultSize": "small",
+  "cpu": {
+    "small": { "vcpus": 16, "memoryGiB": 64, "nvmeDevices": 2, "nvmeGiBPerDevice": 440 },
+    "medium": { "vcpus": 32, "memoryGiB": 128, "nvmeDevices": 4, "nvmeGiBPerDevice": 440 },
+    "large": { "vcpus": 64, "memoryGiB": 256, "nvmeDevices": 4, "nvmeGiBPerDevice": 880 },
+    "xl": { "vcpus": 128, "memoryGiB": 512, "nvmeDevices": 4, "nvmeGiBPerDevice": 1760 }
+  },
+  "cpuVariants": [
+    { "suffix": "ds_v7", "processor": "Intel", "generation": 7, "maxVcpus": 128 },
+    { "suffix": "ads_v7", "processor": "AMD", "generation": 7, "maxVcpus": 160 },
+    { "suffix": "ds_v6", "processor": "Intel", "generation": 6, "maxVcpus": 192 },
+    { "suffix": "ads_v6", "processor": "AMD", "generation": 6, "maxVcpus": 96 }
+  ],
+  "gpu": {
+    "small": { "sku": "Standard_NC36ds_xl_RTXPRO6000BSE_v6", "vcpus": 36, "memoryGiB": 132, "gpuCount": 0.25, "gpuMemoryGB": 24, "localNvmeGiB": 1600 },
+    "medium": { "sku": "Standard_NC72ds_xl_RTXPRO6000BSE_v6", "vcpus": 72, "memoryGiB": 264, "gpuCount": 0.5, "gpuMemoryGB": 48, "localNvmeGiB": 3200 },
+    "large": { "sku": "Standard_NC144ds_xl_RTXPRO6000BSE_v6", "vcpus": 144, "memoryGiB": 516, "gpuCount": 1, "gpuMemoryGB": 96, "localNvmeGiB": 6400 },
+    "xl": { "sku": "Standard_NC288ds_xl_RTXPRO6000BSE_v6", "vcpus": 288, "memoryGiB": 1032, "gpuCount": 2, "gpuMemoryGB": 192, "localNvmeGiB": 12800 }
+  },
+  "gpuSupportedUbuntuLts": [ "24_04", "22_04", "20_04" ],
+  "sources": {
+    "cpu": "https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv7-series",
+    "cpuAmdV7": "https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/dadsv7-series",
+    "cpuIntelV6": "https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv6-series",
+    "cpuAmdV6": "https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/dadsv6-series",
+    "gpu": "https://learn.microsoft.com/azure/virtual-machines/sizes/gpu-accelerated/nc-rtxpro6000-bse-v6-series",
+    "gpuOs": "https://learn.microsoft.com/azure/virtual-machines/sizes/gpu-accelerated/nc-rtxpro6000-bse-v6-series-overview"
+  }
+}
