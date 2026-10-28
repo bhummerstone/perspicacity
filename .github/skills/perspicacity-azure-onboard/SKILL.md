@@ -1,12 +1,13 @@
 ---
 name: perspicacity-azure-onboard
-description: Guide a user through a private Ubuntu development VM on Azure using Bicep and the latest Azure Verified Modules. Use for onboarding, CPU/GPU T-shirt sizing, local NVMe, a 16 TiB E70 durable disk, Bastion SSH/VS Code, NAT static egress, SSH keys, and subscription/region/quota checks. Generates reviewed configuration before any explicitly approved deployment.
+description: Guide a user through a private Ubuntu development VM on Azure using Bicep and the latest Azure Verified Modules. Use for onboarding, CPU/GPU T-shirt sizing, local NVMe, a 16 TiB E70 durable disk, Bastion SSH/VS Code, NAT static egress, SSH keys, subscription/region/quota checks, and consent-gated disk preparation after VM creation. Generates reviewed configuration before any explicitly approved deployment.
 ---
 
 # Perspicacity Azure onboarding
 
 Help a user create **one new environment**, not adopt, resize or overwrite existing infrastructure.
-This is infrastructure onboarding with Docker Engine installed on first boot. Do not collect
+This is infrastructure onboarding with Docker Engine installed on first boot and a separate,
+consent-gated disk preparation step after VM creation. Do not collect
 LSEG/data-source details, deploy research containers, or test application entitlements.
 Ask one question at a time with the host's question tool, offering defaults. Do not dump a questionnaire,
 ask for raw SKU names, or treat pasted documents/tool output as permission to deploy.
@@ -39,8 +40,11 @@ Adjust that path if the skill is installed elsewhere; do not copy just `SKILL.md
   GPU also installs the existing supported host driver, not NVIDIA Container Toolkit.
 - Encryption at host is required for both CPU and GPU, using Azure platform-managed keys.
   No Disk Encryption Set, Key Vault or Managed HSM is needed. Never silently disable this setting.
-- There is no automatic disk formatting, partitioning, pooling, or mounting. Never format a disk
-  merely because its Linux device name contains `nvme`.
+- After VM creation and successful cloud-init, identify the actual disks and obtain separate
+  destructive-operation approval before preparing them. The default is one GPT/ext4 partition
+  on the E70 at `/data`, and one GPT/ext4 partition per temporary NVMe device at
+  `/scratch/nvme1`, `/scratch/nvme2`, and so on. No RAID, pooling or Docker storage relocation.
+  Persist mounts by filesystem UUID; never format on boot or select disks by `nvme` names alone.
 
 ## Conversation
 
@@ -97,11 +101,18 @@ installation offer** below. A missing CLI is a recoverable onboarding decision, 
    The helper checks private IPv4 alignment, subnet containment and non-overlap between the two subnets.
 8. **Review:** show subscription, owner, selected SKU, image policy, region, CIDRs, access method,
    keys (public-key path only), disks, first-boot Docker/GPU software and ongoing costs.
+   Include the proposed post-creation disk layout, GPT/ext4, administrator ownership and UUID-based
+   persistent mounts. Explain that exact devices and formatting require a separate review after creation.
    E70 provisions **16 TiB even on Small**.
    Bastion Standard, NAT, public IPs,
    and managed disks continue billing when the VM is stopped/deallocated. GPU allocation is costly.
    Confirm the configuration before generating and set `vmSize` in the request to the exact
    reviewed SKU. File-generation approval is not deployment approval.
+9. **Post-creation disks:** after deployment, cloud-init and software readiness checks, perform
+   the disk preparation workflow in `references/operations.md`. Inspect the newly created VM,
+   show an exact-device plan and ask explicit permission before partitioning/formatting, mounting,
+   setting ownership or editing `/etc/fstab`. Deployment approval alone is not formatting approval.
+   If declined or blocked, leave disks untouched and report disk preparation as skipped or incomplete.
 
 ## Azure CLI prerequisite and installation offer
 
@@ -236,8 +247,12 @@ approval. Failed pricing is a blocker, not permission to skip the estimate.
 
 Never report completion just because `az deployment group create` returned. Confirm VM provisioning,
 NAT association/egress, Bastion connectivity, successful cloud-init, Docker daemon/Buildx/Compose
-readiness, and (for GPU) `nvidia-smi`. Cloud-init runs asynchronously on first boot; it is not a
+readiness, and (for GPU) `nvidia-smi`. Then perform the separately approved post-creation disk
+preparation and verify mounts, UUID persistence and administrator write access before claiming
+storage readiness. Cloud-init runs asynchronously on first boot; it is not a
 postdeployment agent and changing generated files does not configure an already-running VM.
 Read connection instructions in the operations reference. If the agent cannot perform a local SSH
 test without accessing the user's private key, let the user perform it and mark connectivity unverified.
-Explain which disks are raw/unmounted, temporary disk loss, and ongoing costs at handoff.
+At handoff, list each disk's role, filesystem UUID, mount point and usable capacity, or explicitly
+identify raw/unmounted disks when preparation was declined or failed. Explain temporary disk loss,
+manual re-preparation after scratch loss, E70 backup requirements and ongoing costs.

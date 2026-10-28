@@ -47,6 +47,12 @@ Keep local generated files ignored; they still contain subscription IDs, resourc
 Review Bicep and the `avm-versions.json` pins. New AVM interfaces may require a reviewed template update;
 do not mask compile failures with an older version unless the user explicitly approves that deviation.
 
+Azure's platform-image metadata does not guarantee an OS disk size field. If it is absent, the helper
+emits a warning and records the limitation instead of assuming a size; compatibility with the fixed
+128 GiB OS disk still requires ARM validation before deployment. Reported sizes above 128 GiB are
+rejected. CPU image controller capabilities are parsed as comma-separated tokens with whitespace
+trimmed, and must explicitly include `NVMe`.
+
 Collect an accountable owner/team identifier, not credentials or personal contact details. The required
 `owner` parameter tags all seven top-level AVM resources; the resource-group command below applies
 the same tag to the group. A tag does not grant RBAC access. Requests generated before this field
@@ -238,8 +244,9 @@ No Docker Hub image is pulled or application container started automatically.
 Docker stays on its local Unix socket. Use `sudo`; adding a user to `docker` grants root-equivalent
 access and requires a separate, explicit decision. No Docker TCP listener or inbound container ports
 are configured. Keep NSG/Bastion restrictions in place if containers are introduced later.
-Docker's default data directory is on the OS disk (`/var/lib/docker`), not the unmounted E70 disk or
-temporary NVMe. No disks are formatted/mounted and Docker storage is not relocated automatically.
+Docker's default data directory stays on the OS disk (`/var/lib/docker`), not the E70 disk or
+temporary NVMe. Cloud-init does not format or mount disks. The separate post-creation disk step below
+does not move Docker storage or change Docker's configuration.
 
 Cloud-init runs on **first boot**, not on every restart. Updating the scripts/parameters does not
 retrofit existing VMs, upgrade their Docker installation, or rerun cloud-init. Regenerate/review older
@@ -271,23 +278,124 @@ Do not install generic Ubuntu NVIDIA drivers in place of the supported Azure GRI
 If the installed kernel/driver requires a reboot, ask before rebooting, then rerun `nvidia-smi`.
 If the documentation disagrees or installation fails, surface the mismatch rather than claiming success.
 
-## Disks
+## Post-creation disk preparation
+
+Make this a normal onboarding step after VM creation, successful cloud-init and Docker/GPU readiness,
+not an unattended first-boot action. This prepares disks on the environment just created by this flow;
+it does not authorize adopting, reformatting or changing storage on other VMs. Updating the skill or
+generated files does not modify an already-running VM. Use the user-owned Bastion SSH session, or
+Azure Run Command with permission for the guest inspection and subsequent approved mutations.
 
 The data disk is **E70: 16,384 GiB StandardSSD_LRS**, LUN 0, caching None. This is separate from both
 the OS disk and the local NVMe devices. Its storage class/size selects the Standard SSD capacity tier;
 do not set the Premium disk `tier: P70` property.
 
-Inspect disks with `lsblk -o NAME,SIZE,MODEL,SERIAL,FSTYPE,MOUNTPOINTS` and Azure's LUN/device mapping.
-Use [Azure NVMe disk identification](https://learn.microsoft.com/azure/virtual-machines/enable-nvme-interface)
-and [temporary NVMe disk guidance](https://learn.microsoft.com/azure/virtual-machines/enable-nvme-temp-faqs).
-CPU remote managed disks also use NVMe, so `/dev/nvme*` alone is **not** proof a device is scratch space.
-Device paths may differ by kernel/image/controller.
+### Inspect and identify without changing disks
 
-Do not autoformat on boot. If the user wants mounted scratch/data storage, identify the devices,
-show their models/serials/LUNs/filesystems, propose mount points and ask for explicit destructive
-format/pool approval for the exact devices. Never run `mkfs`/RAID commands on an ambiguous device or
-an existing filesystem. Use filesystem UUIDs rather than transient device names for durable mounts.
-Local scratch must be reconstructible after host events; no important data should exist there alone.
+Run inside the VM:
+
+```bash
+lsblk -e 7 -o NAME,PATH,TYPE,SIZE,MODEL,SERIAL,FSTYPE,UUID,MOUNTPOINTS
+findmnt -rn -o SOURCE,TARGET,FSTYPE
+swapon --show
+cat /etc/fstab
+```
+
+Match the VM's Azure `storageProfile` managed-disk resource ID and LUN 0 to the guest device.
+For NVMe, use `sudo azure-nvme-id` from `azure-vm-utils` when available: it distinguishes `type=os`,
+`type=data, lun=0` and `type=local`. For SCSI, use Azure's SCSI LUN mapping. Follow
+[Azure disk identification and preparation](https://learn.microsoft.com/azure/virtual-machines/linux/attach-disk-portal)
+and [temporary NVMe guidance](https://learn.microsoft.com/azure/virtual-machines/enable-nvme-temp-faqs).
+If identification tools are missing, request installation permission or stop for manual identification;
+do not guess. CPU managed disks also use NVMe: `/dev/nvme*`, capacity or model alone is not proof of
+scratch storage, and serials are not necessarily unique. Never reuse device paths from another VM.
+
+Explicitly exclude the OS disk and every ancestor of `/`, `/boot`, EFI, other mounted filesystems,
+swap, and active device-mapper/LVM/RAID devices. For each proposed whole disk, inspect its children,
+block-device holders and `sudo wipefs --no-act <exact-device>`. Require an unpartitioned,
+unmounted disk with no filesystem, partition-table, swap, LVM or RAID signatures and no holders.
+Inspection errors or ambiguous identity block preparation. An existing filesystem or partition is
+not permission to erase it: stop and review it, even on a newly created VM.
+
+### Review the exact-device plan and obtain consent
+
+Recommend this layout, without pooling or RAID:
+
+| Disk role | Layout | Mount point | Ownership |
+|---|---|---|---|
+| E70 managed disk, LUN 0 | GPT, one ext4 partition spanning usable disk space | `/data` | Configured Linux administrator and their primary group, mode `0750` |
+| Each positively identified local NVMe disk | GPT, one ext4 partition per device | `/scratch/nvme1`, `/scratch/nvme2`, etc. | Same administrator/group, mode `0750` |
+
+Show each exact device path, Azure role/LUN or local index, model, serial, observed size, signature
+status and proposed mount point. CPU device count/capacity must match the selected profile.
+For GPU, use actual identified devices and reconcile their total capacity with the profile; do not
+invent a count. Keep the approved local-index/identity-to-mount mapping, not kernel enumeration order.
+Resolve the administrator's primary group with `id`; Azure Run Command runs as root, so do not use
+its `$USER` as the owner. Stop on missing accounts or unexpected device counts/capacities.
+
+Explain that partitioning/formatting destroys data on the listed devices, and that scratch can be
+lost on deallocation/redeployment/host events. Ask one explicit approval question covering those
+exact disks, GPT/ext4, mount points, administrator ownership and `/etc/fstab` changes. Neither billable
+deployment approval nor a request to update the skill grants this destructive-operation consent.
+Allow the user to decline or revise the layout. No commands that modify storage run before approval.
+
+### Prepare only the approved empty devices
+
+Recheck identity, signatures, holders, mounts and partition state immediately before each destructive
+operation. If anything differs from the reviewed plan, stop and obtain a new review. Confirm required
+utilities exist; missing packages need separate installation consent. Run one disk at a time with
+fail-fast error handling; never glob devices or pipe discovery output directly into destructive tools.
+
+For each exact approved disk, create a GPT and one aligned partition from `1MiB` to `100%` with
+`parted`. GPT is required for the 16 TiB E70; do not use MBR. Run `partprobe` and `udevadm settle`,
+then inspect the new partition's parent, size and path before formatting that partition with
+`mkfs.ext4 -m 0` (no reserved percentage on these non-OS data volumes). Do not use force flags,
+`wipefs` erase modes, RAID/LVM commands or format the whole OS disk. Never derive a partition path
+by blindly appending `1`: NVMe and SCSI naming differ. Record the resulting filesystem UUID with
+`blkid`, require ext4 and a nonempty unique UUID, and keep it associated with the approved disk.
+
+Require mount targets to be absent or empty real directories, not symlinks or existing mounts;
+stop on nonempty paths or conflicts. Create unmounted leaf mount directories as root-owned mode
+`0000`, so ordinary users cannot accidentally write to the OS disk if a data/scratch mount is absent.
+The `/scratch` parent may be root-owned mode `0755`. Mount each new filesystem at its approved target,
+verify the exact source/UUID and ext4 type with `findmnt --mountpoint <target>`, then set the mounted
+filesystem root's owner/group and mode `0750`. Do not recursively chown existing data or use `0777`.
+
+Back up `/etc/fstab` to a unique path before editing; preserve unrelated lines. Add exactly one entry
+per new filesystem using its actual UUID, not `/dev/nvme*` or `/dev/sd*`. Example entry shapes
+(placeholders are not executable configuration):
+
+```fstab
+UUID=<E70-filesystem-UUID> /data ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2
+UUID=<first-local-filesystem-UUID> /scratch/nvme1 ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2
+```
+
+Add one scratch entry per actual approved local device. Reject duplicate UUIDs, conflicting targets
+or existing entries that disagree with the plan; do not blindly append or replace unrelated mounts.
+Run `sudo findmnt --verify --verbose` and `sudo systemctl daemon-reload`; surface all errors.
+If any step fails, stop and report which disks were partitioned, formatted, mounted or persisted.
+Do not erase/reformat completed disks on retry or claim a rollback; preserve the fstab backup.
+
+### Verify and hand off storage
+
+Before any workload uses the new mounts, test each newly prepared target by syncing, unmounting only
+that target and mounting it again by mount point from `/etc/fstab`. Do not unmount pre-existing or
+busy mounts, use force/lazy unmount, run a broad `mount -a`, or reboot without separate consent.
+Verify again with `findmnt --mountpoint <target>`, `lsblk -f` and `df -hT <target>`: source/UUID,
+ext4 type and usable capacity must match the plan. As the configured administrator (not root),
+create a uniquely named temporary file on each verified mount and delete only that file to prove
+write access. A successful `df` or write alone is insufficient: an unmounted directory can be on `/`.
+
+Report the device/role, filesystem UUID, mount point, usable capacity, owner and persistence result
+for every disk. If preparation was declined, blocked or only partly completed, explicitly list the
+raw/unmounted or unverified devices; do not call storage ready. Docker remains on its OS-disk default.
+
+UUID entries preserve mounts across ordinary reboots while the filesystems survive. After local
+scratch loss, `nofail` lets the VM boot but old UUIDs will not mount replacement blank disks.
+Never install a boot-time autoformat service. Reinspect actual devices, obtain new exact-device
+formatting consent and update only the affected scratch entries. Applications must check that their
+scratch/data paths are mounted before writing, especially when running as root. No important data
+may exist only on scratch; it must be reconstructible.
 
 The E70 disk uses `Detach` on VM deletion, but is **not** protected from resource-group deletion.
 Detached disks keep billing and still need backups if the data matters.

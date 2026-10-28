@@ -473,9 +473,38 @@ class ImageTests(unittest.TestCase):
     def image(self):
         return {
             "name": IMAGE["version"], "architecture": "x64", "hyperVGeneration": "V2",
-            "osDiskImage": {"sizeInGb": 30},
-            "features": [{"name": "DiskControllerTypes", "value": "SCSI,NVMe"}],
+            "osDiskImage": {"operatingSystem": "Linux"},
+            "features": [{"name": "DiskControllerTypes", "value": "SCSI, NVMe"}],
         }
+
+    def test_missing_image_disk_size_is_disclosed_not_assumed(self):
+        error = io.StringIO()
+        with patch.object(onboarding, "az", return_value=self.image()), redirect_stderr(error):
+            self.assertEqual(onboarding.resolve_image(CONFIG, IMAGE), IMAGE)
+        self.assertIn("does not report OS disk size", error.getvalue())
+        self.assertIn("128 GiB OS disk requires ARM validation", error.getvalue())
+
+    def test_reported_image_disk_size_is_still_checked(self):
+        for size in (30, 128):
+            image = {**self.image(), "osDiskImage": {"operatingSystem": "Linux", "sizeInGb": size}}
+            error = io.StringIO()
+            with self.subTest(size=size), patch.object(
+                onboarding, "az", return_value=image
+            ), redirect_stderr(error):
+                self.assertEqual(onboarding.resolve_image(CONFIG, IMAGE), IMAGE)
+                self.assertEqual(error.getvalue(), "")
+
+    def test_nvme_controller_tokens_accept_whitespace_but_require_exact_match(self):
+        for controllers in ("SCSI,NVMe", "SCSI, NVMe", " NVMe , SCSI "):
+            image = {**self.image(), "features": [{"name": "DiskControllerTypes", "value": controllers}]}
+            with self.subTest(controllers=controllers), patch.object(onboarding, "az", return_value=image):
+                self.assertEqual(onboarding.resolve_image(CONFIG, IMAGE), IMAGE)
+        for controllers in ("SCSI", "NotNVMe", ""):
+            image = {**self.image(), "features": [{"name": "DiskControllerTypes", "value": controllers}]}
+            with self.subTest(controllers=controllers), patch.object(
+                onboarding, "az", return_value=image
+            ), self.assertRaisesRegex(onboarding.OnboardingError, "does not advertise NVMe"):
+                onboarding.resolve_image(CONFIG, IMAGE)
 
     def test_latest_resolves_to_exact_version(self):
         with patch.object(onboarding, "az", side_effect=[
@@ -569,6 +598,7 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("checkedAtUtc", report)
         self.assertEqual(report["owner"], CONFIG["owner"])
         self.assertEqual(report["permissionCheck"]["status"], "ReportedActionsAllowed")
+        self.assertTrue(any("128 GiB OS disk requires ARM validation" in entry for entry in report["limitations"]))
         self.assertEqual(report["hostEncryption"], {
             "enabled": True, "keyManagement": "PlatformManaged",
             "subscriptionFeatureState": "Registered", "skuSupported": True,

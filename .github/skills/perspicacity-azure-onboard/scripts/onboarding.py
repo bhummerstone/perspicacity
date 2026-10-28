@@ -364,10 +364,19 @@ def resolve_image(config, pinned=None):
         raise OnboardingError("The image must advertise x64 architecture and Generation 2 support.")
     if image.get("plan"):
         raise OnboardingError("This image requires Marketplace terms; use a standard Canonical server image.")
-    if int(image["osDiskImage"]["sizeInGb"]) > 128:
-        raise OnboardingError("The image OS disk exceeds the template's 128 GiB OS disk.")
+    os_disk = image["osDiskImage"]
+    if "sizeInGb" in os_disk:
+        if int(os_disk["sizeInGb"]) > 128:
+            raise OnboardingError("The image OS disk exceeds the template's 128 GiB OS disk.")
+    else:
+        print(
+            "WARNING: Azure image metadata does not report OS disk size; "
+            "compatibility with the 128 GiB OS disk requires ARM validation before deployment.",
+            file=sys.stderr,
+        )
     features = {entry["name"].lower(): entry["value"] for entry in image.get("features", [])}
-    if config["compute"] == "cpu" and "NVMe" not in features.get("diskcontrollertypes", "").split(","):
+    controllers = {value.strip() for value in features.get("diskcontrollertypes", "").split(",")}
+    if config["compute"] == "cpu" and "NVMe" not in controllers:
         raise OnboardingError("The CPU image does not advertise NVMe support; review image compatibility.")
     version = image["name"]
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
@@ -625,6 +634,7 @@ def preflight(config, pinned_image=None):
             "Only network quota counters returned by Azure were checked; deployment validation is still required.",
             "Deny assignments/conditional access, Azure Policy and billing restrictions require separate review and ARM validation.",
             "Disk capacity and service-specific limits are finally checked by ARM validation/allocation.",
+            "Azure image metadata may omit OS disk size; compatibility with the 128 GiB OS disk requires ARM validation.",
         ],
     }
 

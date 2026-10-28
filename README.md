@@ -13,8 +13,9 @@ The agent guides you through subscription, CPU/GPU, region, priced Small/Medium/
 owner/team, username, local SSH keys and private IP addressing. It generates configuration, checks
 live Azure availability, quota and reported deployment permissions, and requires separate approval
 of the fresh itemized PAYG estimate before deploying billable resources. Bastion SSH/VS Code remains
-the secure default. Docker Engine is installed on first boot; application containers and data-source
-integrations remain out of scope.
+the secure default. Docker Engine is installed on first boot. After VM creation and software readiness,
+the agent identifies disks and requests separate formatting approval before preparing data/scratch
+mounts. Application containers and data-source integrations remain out of scope.
 To use it in another repository, copy the entire `.github/skills/perspicacity-azure-onboard` directory,
 including its assets, references and Python helper, into that repository's skills directory.
 
@@ -53,7 +54,10 @@ families. It never shrinks the T-shirt or changes region to bypass quota.
 Every profile has a separate **16 TiB E70 Standard SSD LRS** durable data disk and a 128 GiB Premium
 SSD OS disk. The E70 data disk is detached when only the VM is deleted; deleting the resource group
 still deletes it. Local NVMe is temporary, may span devices, and can be erased on deallocation or
-host events. Disks are not automatically formatted, pooled or mounted.
+host events. After creation, the skill recommends GPT/ext4 with E70 mounted at `/data` and each
+temporary NVMe mounted separately at `/scratch/nvme1`, `/scratch/nvme2`, etc. Actual devices must be
+identified and explicitly approved before partitioning/formatting. The OS disk is excluded, and there
+is no automatic pooling, RAID or boot-time formatting.
 
 CPU resolves the latest stable Canonical Ubuntu LTS with x64/Gen2/NVMe support.
 GPU uses the latest documented supported Ubuntu LTS (currently 24.04) and bootstraps the supported
@@ -69,7 +73,12 @@ Both CPU and GPU use cloud-init to install Docker Engine/CLI, containerd, Buildx
 Docker's official Ubuntu APT repository and enable the daemon. GPU retains the supported host-driver
 bootstrap. Docker requires `sudo`, uses the local Unix socket, and has no public TCP endpoint.
 No research containers or NVIDIA Container Toolkit are installed. Docker storage defaults to the OS
-disk; the E70 and local NVMe remain untouched. This adds no Azure resources or fixed service charge.
+disk; cloud-init leaves E70 and local NVMe untouched. A separate, consent-gated post-creation step
+prepares empty disks, grants the configured administrator access, persists mounts by filesystem UUID
+in `/etc/fstab` and verifies remounts and administrator write access. Docker storage is not moved.
+After scratch loss, new device inspection and formatting consent are required; missing scratch
+UUIDs do not trigger automatic formatting. Declined or incomplete preparation is reported explicitly.
+This adds no Azure resources or fixed service charge.
 Cloud-init may still be running after Azure reports VM provisioning success. Require
 `sudo cloud-init status --wait`, Docker daemon/plugin checks and (for GPU) `nvidia-smi` before claiming
 readiness; see [operations](.github/skills/perspicacity-azure-onboard/references/operations.md).
